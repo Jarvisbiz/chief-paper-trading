@@ -71,6 +71,7 @@ def evaluate(pair,bars):
     now=int(time.time())
     today=datetime.now(timezone.utc).date().isoformat()
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
         for ts,close,volume in bars:
             c.execute("INSERT OR REPLACE INTO candles VALUES (?,?,?,?)",(pair,ts,close,volume))
         rows=list(reversed(c.execute("SELECT * FROM candles WHERE pair=? ORDER BY ts DESC LIMIT 55",(pair,)).fetchall()))
@@ -95,6 +96,8 @@ def evaluate(pair,bars):
             put(c,"day_start",eq)
         day_start=float(get(c,"day_start"))
         positions=c.execute("SELECT * FROM positions").fetchall()
+        day_floor=int(datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+        completed=c.execute("SELECT COUNT(*) n FROM trades WHERE side='SELL' AND ts>=?",(day_floor,)).fetchone()["n"]
         pos=next((p for p in positions if p["pair"]==pair),None)
         if pos is not None:
             peak=max(pos["peak"],price)
@@ -109,7 +112,7 @@ def evaluate(pair,bars):
                 put(c,"cash",cash+gross-exit_fee)
                 c.execute("DELETE FROM positions WHERE pair=?",(pair,))
                 c.execute("INSERT INTO trades(ts,pair,side,qty,price,fee,reason,pnl) VALUES (?,?,?,?,?,?,?,?)",(now,pair,"SELL",pos["qty"],execution,exit_fee,reason,pnl))
-        elif (not PAUSED and eq>=day_start*.98 and len(positions)<2
+        elif (not PAUSED and get(c,"emergency_paused")!="true" and completed+len(positions)<5 and eq>=day_start*.98 and len(positions)<2
               and breakout and mom>.02 and avg_v>0 and v>avg_v*1.5):
             # Notional <=20% equity; modeled stop-loss risk <=0.5% equity.
             budget=min(cash/(1+FEE),eq*.20,eq*.005/.03)
@@ -205,7 +208,31 @@ def dashboard():
         cash=float(get(c,"cash"))
         trades=[dict(t) for t in c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 100")]
         curve=[dict(e) for e in c.execute("SELECT * FROM equity ORDER BY ts DESC LIMIT 200")][::-1]
-        return {"mode":"PAPER_ONLY","markets":PAIRS,"cash":round(cash,2),"equity":round(equity_value(c),2),"positions":positions,"trades":trades,"equity_history":curve,"last_scan":get(c,"last_scan"),"last_success":get(c,"last_success"),"last_error":get(c,"last_error"),"entries_paused":PAUSED or equity_value(c)<float(get(c,"day_start"))*.98}
+        stopped=get(c,"emergency_paused")=="true"
+        floor=int(datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+        j=c.execute("SELECT COUNT(CASE WHEN side='SELL' THEN 1 END) completed,COALESCE(SUM(pnl),0) net,COALESCE(SUM(fee),0) fees FROM trades WHERE ts>=?",(floor,)).fetchone()
+        journal={"day":datetime.now(timezone.utc).date().isoformat(),"completed":j["completed"],"net":round(j["net"],6),"fees":round(j["fees"],6),"limit":5,"reserved":len(positions)}
+        return {"mode":"PAPER_ONLY","markets":PAIRS,"cash":round(cash,2),"equity":round(equity_value(c),2),"positions":positions,"trades":trades,"equity_history":curve,"last_scan":get(c,"last_scan"),"last_success":get(c,"last_success"),"last_error":get(c,"last_error"),"entries_paused":PAUSED or stopped or journal["completed"]+len(positions)>=5 or equity_value(c)<float(get(c,"day_start"))*.98,"emergency_paused":stopped,"controls_supported":True,"fee_rate":FEE,"slippage_rate":SLIPPAGE,"journal":journal}
+
+@app.post("/api/control")
+async def control(req:Request):
+    # The global Basic-auth middleware protects this endpoint. No orders or live mode.
+    if len(await req.body())>200:
+        return JSONResponse({"error":"Invalid control"},status_code=400)
+    try:
+        d=await req.json()
+    except (ValueError,UnicodeDecodeError):
+        return JSONResponse({"error":"Invalid JSON"},status_code=400)
+    action=d.get("action") if isinstance(d,dict) else None
+    phrase="STOP PAPER ENTRIES" if action=="pause" else "RESUME PAPER ENTRIES"
+    if action not in ("pause","resume") or d.get("confirmation")!=phrase:
+        return JSONResponse({"error":"Explicit paper confirmation required"},status_code=400)
+    # Serialize with evaluate's write transaction; acknowledge only after durable commit.
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        put(c,"emergency_paused","true" if action=="pause" else "false")
+        put(c,"last_control",datetime.now(timezone.utc).isoformat())
+    return {"mode":"PAPER_ONLY","emergency_paused":action=="pause","protective_exits_enabled":True}
 
 HTML=String = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="utf-8"><title>CHIEF | Paper Only</title><style>
 body{background:#0d1421;color:#e7efff;font:15px system-ui;margin:0;padding:25px;max-width:1050px}
@@ -228,3 +255,4 @@ refresh();setInterval(refresh,30000)
 @app.get("/",response_class=HTMLResponse)
 def home():
     return HTMLResponse(HTML)
+
