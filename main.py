@@ -27,11 +27,14 @@ import futures_runtime as futures
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chief")
-VERSION = "2.4.0-paper"
+VERSION = "2.5.0-paper"
 PAIRS = ("BTC-USD", "ETH-USD", "SOL-USD")
 DB_PATH = os.getenv("DB_PATH", "/data/chief.sqlite")
 START_CASH = float(os.getenv("PAPER_STARTING_CASH", "80"))
 PRACTICE_VENUE = os.getenv("PAPER_PRACTICE_VENUE", "SPOT_PRICE_PROXY")
+SIGNAL_SOURCE = os.getenv("PAPER_SIGNAL_SOURCE", "SPOT_REFERENCE")
+SIZING_MODE = os.getenv("PAPER_SIZING_MODE", "RISK_LIMITED")
+if SIGNAL_SOURCE not in ("SPOT_REFERENCE", "CONTRACT") or SIZING_MODE not in ("RISK_LIMITED", "FULL_MARGIN"): raise ValueError("Unsupported paper configuration")
 if not math.isfinite(START_CASH) or START_CASH <= 0: raise ValueError("Invalid practice starting cash")
 FEE = float(os.getenv("PAPER_FEE_RATE", "0.009"))
 # Optional additional stress buffer on top of measured book impact, not Coinbase's slippage fee.
@@ -105,6 +108,8 @@ def init():
         c.execute("CREATE TABLE IF NOT EXISTS news_sources(source TEXT PRIMARY KEY,checked INTEGER,success INTEGER,last_item INTEGER,error TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS decisions(pair TEXT,bar INTEGER,ts INTEGER,status TEXT,direction TEXT,reasons TEXT,evidence TEXT,PRIMARY KEY(pair,bar))")
         c.execute("CREATE TABLE IF NOT EXISTS strategy_decisions(pair TEXT,strategy TEXT,bar INTEGER,ts INTEGER,status TEXT,direction TEXT,reasons TEXT,evidence TEXT,PRIMARY KEY(pair,strategy,bar))")
+        c.execute("CREATE TABLE IF NOT EXISTS signal_bars AS SELECT * FROM bars WHERE 0")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS signal_bars_key ON signal_bars(pair,interval,ts)")
         c.execute("INSERT OR IGNORE INTO strategy_decisions SELECT pair,'BREAKOUT',bar,ts,status,direction,reasons,evidence FROM decisions")
         for k, v in (("cash", START_CASH), ("starting_cash", START_CASH), ("day", ""), ("day_start", START_CASH), ("last_scan", "never"), ("last_success", "never"), ("last_error", ""), ("last_mark", "never")):
             c.execute("INSERT OR IGNORE INTO state VALUES (?,?)", (k, str(v)))
@@ -158,7 +163,7 @@ def risk_blocks(c, now):
     if PAUSED or get(c, "emergency_paused") == "true": reasons.append("New paper entries paused")
     if get(c, "daily_halt") == "true": reasons.append("2% daily drawdown halt latched until next UTC day")
     if opened >= 5 or completed + len(positions) >= 5: reasons.append("Five-trade daily ceiling reached")
-    if len(positions) >= 2: reasons.append("Two-position limit reached")
+    if len(positions) >= (1 if SIZING_MODE == "FULL_MARGIN" else 2): reasons.append("Full-margin paper mode permits one position" if SIZING_MODE == "FULL_MARGIN" else "Two-position limit reached")
     if PRACTICE_VENUE == "COINBASE_US_FUTURES":
         if equity_value(c) <= 0 or float(get(c, "cash")) < 0: reasons.append("Futures margin deficit; no new entries")
         if any(p["model"] == futures.MODEL and p["exit_pending"] for p in positions): reasons.append("Futures protective exit pending; no new entries")
@@ -210,18 +215,95 @@ def store_bars(c, pair, interval, bars):
     c.executemany("INSERT OR REPLACE INTO bars VALUES (?,?,?,?,?,?,?,?)", [(pair, interval, b["ts"], b["low"], b["high"], b["open"], b["close"], b["volume"]) for b in bars])
 
 
+class MarketDataUnavailable(ValueError):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+async def read_book(client, product):
+    # A bounded retry avoids reusing an intermediary's cached response. Never
+    # replace the exchange timestamp with fetch time or relax the ten-second cap.
+    error = None
+    for attempt in range(2):
+        try:
+            r = await client.get("https://api.coinbase.com/api/v3/brokerage/market/product_book", params={"product_id":product,"limit":50,"_cb":str(time.time_ns())}, headers={"Cache-Control":"no-cache, no-store","Pragma":"no-cache"})
+            r.raise_for_status()
+            return normalize_book(r.json(),product,time.time())
+        except ValueError as exc:
+            error = MarketDataUnavailable("STALE_BOOK" if "Stale" in str(exc) else "INVALID_BOOK",str(exc))
+            if error.code != "STALE_BOOK": raise error
+        except httpx.HTTPError as exc:
+            error = MarketDataUnavailable("BOOK_TRANSPORT",type(exc).__name__)
+        if attempt == 0: await asyncio.sleep(.2)
+    raise error
+
+
 async def fetch_quote(client, pair):
-    s = None
+    spec = None
     if PRACTICE_VENUE == "COINBASE_US_FUTURES":
-        with db() as c: s = active_contract(c,pair,time.time())
-    product = s["product_id"] if s else pair
-    r = await client.get("https://api.coinbase.com/api/v3/brokerage/market/product_book", params={"product_id":product,"limit":50}, headers={"Cache-Control":"no-cache"})
-    r.raise_for_status()
-    q = normalize_book(r.json(),product,time.time())
-    if s:
-        q.update(product_id=product,contract=s)
-        for side in ("bids","asks"):q[side]=[(price,contracts*s["contract_size"]) for price,contracts in q[side]]
+        with db() as c: spec = active_contract(c,pair,time.time())
+    product = spec["product_id"] if spec else pair
+    q = await read_book(client,product)
+    if spec:
+        q.update(product_id=product,contract=spec)
+        for side in ("bids","asks"):q[side]=[(price,contracts*spec["contract_size"]) for price,contracts in q[side]]
     return q
+
+
+def signal_table():
+    return "signal_bars" if PRACTICE_VENUE == "COINBASE_US_FUTURES" and SIGNAL_SOURCE == "SPOT_REFERENCE" else "bars"
+
+
+async def fetch_signal_bars(client,pair,interval):
+    end=int(time.time()//interval)*interval
+    count=120 if interval==60 else 350
+    r=await client.get("https://api.coinbase.com/api/v3/brokerage/market/products/"+pair+"/candles",params={"start":end-count*interval,"end":end,"granularity":{60:"ONE_MINUTE",300:"FIVE_MINUTE",3600:"ONE_HOUR",86400:"ONE_DAY"}[interval],"limit":count,"_cb":str(time.time_ns())},headers={"Cache-Control":"no-cache, no-store"})
+    r.raise_for_status()
+    raw=[[b["start"],b["low"],b["high"],b["open"],b["close"],b["volume"]] for b in r.json().get("candles",[])]
+    bars=normalize_bars(raw,interval,time.time())
+    if not bars:raise MarketDataUnavailable("SIGNAL_EMPTY","Liquid spot reference history unavailable")
+    return bars
+
+
+def store_signal_bars(c,pair,interval,bars):
+    c.executemany("INSERT OR REPLACE INTO signal_bars VALUES (?,?,?,?,?,?,?,?)",[(pair,interval,b["ts"],b["low"],b["high"],b["open"],b["close"],b["volume"]) for b in bars])
+
+
+def map_signal_evidence(pair,quote,evidence,now):
+    ev={**evidence,"product_id":quote.get("product_id") if quote else None,"price_source":"FUTURES_CONTRACT_CANDLES"}
+    if SIGNAL_SOURCE != "SPOT_REFERENCE": return ev
+    ref=quote.get("signal_quote") if quote else None
+    if not ref or ref.get("product_id") != pair or not -5<=now-ref.get("ts",0)<=10 or not quote or not -5<=now-quote.get("ts",0)<=10:
+        raise MarketDataUnavailable("BASIS_UNAVAILABLE","Fresh paired spot and futures quotes required for signal mapping")
+    ratio=quote["price"]/ref["price"]
+    if not math.isfinite(ratio) or abs(ratio-1)>.02:
+        raise MarketDataUnavailable("BASIS_OUTLIER","Spot/futures price basis exceeds the 2% sanity bound")
+    ev.update(price_source="SPOT_REFERENCE_MAPPED_TO_FUTURES",signal_source="COINBASE_SPOT_REFERENCE",reference_pair=pair,basis={"ratio":ratio,"spot_price":ref["price"],"futures_price":quote["price"],"spot_ts":ref["ts"],"futures_ts":quote["ts"]})
+    price_keys=("structural_stop","opposite_range_level","atr_1m","atr_5m","one_minute_close","five_minute_close","retest_level","sweep_reference")
+    ev["reference_prices"]={k:evidence[k] for k in price_keys if isinstance(evidence.get(k),(int,float))}
+    for key,value in ev["reference_prices"].items():ev[key]=value*ratio
+    if "levels" in evidence:
+        ev["reference_levels"]=evidence["levels"]
+        ev["levels"]=[{**level,**{k:v*ratio for k,v in level.items() if k in ("open","high","low","midpoint") and isinstance(v,(int,float))}} for level in evidence["levels"]]
+    return ev
+
+
+def input_readiness(c,pair,now):
+    parts={}
+    for interval,minimum in ((60,40),(300,65),(3600,60)):
+        rows=c.execute("SELECT ts FROM "+signal_table()+" WHERE pair=? AND interval=? AND ts+?<=? ORDER BY ts DESC LIMIT ?",(pair,interval,interval,now,minimum)).fetchall()
+        times=sorted(r["ts"] for r in rows)
+        state="WARMING" if len(times)<minimum else "STALE" if now-(times[-1]+interval)>interval+15 else "GAPPED" if any(b-a!=interval for a,b in zip(times,times[1:])) else "READY"
+        parts[str(interval)]={"state":state,"bars":len(times),"last_close":times[-1]+interval if times else None}
+    return parts
+
+
+def save_market_status(pair,status):
+    with db() as c:
+        data=json.loads(get(c,"market_status") or "{}")
+        data[pair]=status
+        put(c,"market_status",json.dumps(data))
 
 
 def normalize_book(data, pair, now):
@@ -384,7 +466,7 @@ def mapping_levels(daily, hourly, now):
 
 def technical_evidence(c, pair, now):
     def bars(interval, closed=True):
-        return [dict(r) for r in c.execute("SELECT * FROM bars WHERE pair=? AND interval=? ORDER BY ts", (pair, interval)) if not closed or r["ts"] + interval <= now]
+        return [dict(r) for r in c.execute("SELECT * FROM "+signal_table()+" WHERE pair=? AND interval=? ORDER BY ts", (pair, interval)) if not closed or r["ts"] + interval <= now]
     h, m = bars(3600), bars(300)
     daily, all_hours = bars(86400, False), bars(3600, False)
     levels = mapping_levels(daily, all_hours, now)
@@ -435,7 +517,7 @@ def atr_value(bars, length=14):
 def scalp_evidence(c, pair, now):
     """A price sweep/reclaim + break/retest, not an order-book liquidity claim."""
     def load(interval, count):
-        rows = c.execute("SELECT * FROM bars WHERE pair=? AND interval=? AND ts+?<=? ORDER BY ts DESC LIMIT ?", (pair, interval, interval, now, count)).fetchall()
+        rows = c.execute("SELECT * FROM "+signal_table()+" WHERE pair=? AND interval=? AND ts+?<=? ORDER BY ts DESC LIMIT ?", (pair, interval, interval, now, count)).fetchall()
         return [dict(r) for r in reversed(rows)]
     h, m, one = load(3600, 60), load(300, 65), load(60, 40)
     ev = {"strategy": "SNIPER_SCALP", "direction": None, "bar": int(now // 60) * 60 - 60, "observed_at": int(now), "technical_pass": False, "reasons": [], "level_confirmations": []}
@@ -641,8 +723,8 @@ def decide(pair, quote, now, strategy="BREAKOUT"):
         ev["news"] = news
         reasons = list(ev["reasons"]) + risk_blocks(c, now)
         if PRACTICE_VENUE == "COINBASE_US_FUTURES":
-            ev["product_id"] = quote.get("product_id") if quote else None
-            ev["price_source"] = "FUTURES_CONTRACT_CANDLES"
+            try: ev=map_signal_evidence(pair,quote,ev,now)
+            except MarketDataUnavailable as exc: reasons.append(str(exc)); ev["mapping_error"]=exc.code
         direction = ev["direction"]
         bar = ev.get("bar", int(now // 300) * 300 - 300)
         ev["bar"] = bar
@@ -654,7 +736,7 @@ def decide(pair, quote, now, strategy="BREAKOUT"):
         if not quote or not -5 <= now - quote["ts"] <= (10 if strategy == "SNIPER_SCALP" else 45): reasons.append("Fresh executable bid/ask unavailable")
         elif (quote["ask"] - quote["bid"]) / quote["price"] > .003: reasons.append("Bid/ask spread exceeds 0.3%; entry blocked")
         elif direction and abs(quote["price"] / ev.get("one_minute_close" if strategy == "SNIPER_SCALP" else "five_minute_close", quote["price"]) - 1) > (.0015 if strategy == "SNIPER_SCALP" else .01): reasons.append("Price moved beyond confirmation tolerance; do not chase")
-        if PRACTICE_VENUE == "COINBASE_US_FUTURES" and quote and direction:
+        if PRACTICE_VENUE == "COINBASE_US_FUTURES" and quote and direction and not ev.get("mapping_error"):
             plan, plan_error = futures.plan(sys.modules[__name__],c,pair,direction,quote,ev,now)
             ev["plan"] = plan
             if plan_error: reasons.append(plan_error)
@@ -708,71 +790,95 @@ async def refresh_futures_budget(client):
     except Exception:log.warning("Futures specifications unavailable; stale inputs cannot produce paper fills")
 
 
+async def scan_once(client,slow_due=True):
+    errors=[]
+    if slow_due:await refresh_news(client)
+    if PRACTICE_VENUE=="COINBASE_US_FUTURES":await refresh_futures_budget(client)
+    for pair in PAIRS:
+        checked=int(time.time());status={"checked_at":checked,"signal_source":"SPOT_REFERENCE" if signal_table()=="signal_bars" else "CONTRACT","state":"UNAVAILABLE","errors":[],"decisions":[]}
+        try:
+            intervals=(300,3600,86400,60) if slow_due else (60,)
+            for interval in intervals:
+                if signal_table()=="signal_bars":
+                    rows=await fetch_signal_bars(client,pair,interval)
+                    with db() as c:store_signal_bars(c,pair,interval,rows)
+                # Contract candles are chart evidence only when spot signals are selected.
+                try:
+                    rows=await fetch_bars(client,pair,interval)
+                    with db() as c:store_bars(c,pair,interval,rows)
+                except Exception as exc:
+                    if signal_table()=="bars":raise
+                    status["chart_warning"]=type(exc).__name__
+            quote=None
+            try:
+                if signal_table()=="signal_bars":
+                    quote,ref=await asyncio.gather(fetch_quote(client,pair),read_book(client,pair))
+                    ref["product_id"]=pair;quote["signal_quote"]=ref
+                    map_signal_evidence(pair,quote,{},int(time.time()))
+                else:quote=await fetch_quote(client,pair)
+                mark_positions({pair:quote},int(time.time()))
+                status.update(product_id=quote.get("product_id",pair),bid=quote["bid"],ask=quote["ask"],mid=quote["price"],book_at=quote["ts"],book_age_seconds=round(time.time()-quote["ts"],2))
+            except (ValueError,httpx.HTTPError) as exc:
+                code=getattr(exc,"code","QUOTE_UNAVAILABLE")
+                status["errors"].append(code+": "+str(exc));quote=None
+            now=int(time.time())
+            with db() as c:readiness=input_readiness(c,pair,now)
+            status["signal_intervals"]=readiness
+            status["state"]="READY" if quote and all(v["state"]=="READY" for v in readiness.values()) else "DATA_BLOCKED"
+            if quote and quote.get("contract",{}).get("session_open") is False:status["state"]="SESSION_CLOSED"
+            for strategy in STRATEGIES if slow_due else ("SNIPER_SCALP",):
+                decision=decide(pair,quote,now,strategy)
+                status["decisions"].append({"strategy":strategy,**decision})
+                log.info("PAPER %s %s %s: %s",strategy,pair,decision["status"],"; ".join(decision["reasons"]))
+        except Exception as exc:
+            message=getattr(exc,"code",type(exc).__name__)+": "+str(exc)[:180]
+            status["errors"].append(message);errors.append(pair+" "+message)
+            log.warning("Market inputs unavailable: %s: %s",pair,message)
+            with db() as c:
+                now=int(time.time())
+                for strategy in STRATEGIES if slow_due else ("SNIPER_SCALP",):
+                    step=60 if strategy=="SNIPER_SCALP" else 300
+                    c.execute("INSERT INTO strategy_decisions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(pair,strategy,bar) DO UPDATE SET ts=excluded.ts,status=excluded.status,direction=excluded.direction,reasons=excluded.reasons,evidence=excluded.evidence WHERE strategy_decisions.status='WAIT'",(pair,strategy,now//step*step-step,now,"WAIT",None,json.dumps(["Market inputs unavailable: "+message]),json.dumps({"input_state":"UNAVAILABLE"})))
+        status["checked_at"]=int(time.time());save_market_status(pair,status)
+    with db() as c:
+        now=int(time.time());put(c,"last_scan",iso(now));put(c,"scan_version",VERSION);put(c,"last_error","; ".join(errors));put(c,"scalp_last_scan",iso(now))
+        if not errors:put(c,"last_success",iso(now));put(c,"scalp_last_success",iso(now))
+        c.execute("DELETE FROM strategy_decisions WHERE status='WAIT' AND ts<? AND strategy='BREAKOUT'",(now-30*86400,))
+        c.execute("DELETE FROM strategy_decisions WHERE status='WAIT' AND ts<? AND strategy='SNIPER_SCALP'",(now-7*86400,))
+        c.execute("DELETE FROM equity WHERE ts<?",(now-90*86400,))
+        for table in ("bars","signal_bars"):
+            c.execute("DELETE FROM "+table+" WHERE ts<? AND interval IN (300,3600)",(now-35*86400,))
+            c.execute("DELETE FROM "+table+" WHERE ts<? AND interval=60",(now-2*86400,))
+
+
 async def scanner():
     await asyncio.sleep(2)
-    async with httpx.AsyncClient(headers={"User-Agent": "ChiefPaperResearch/2.1"}, timeout=15, follow_redirects=False) as client:
-        next_slow, next_fast = 0, 0
+    async with httpx.AsyncClient(headers={"User-Agent":"ChiefPaperResearch/2.5"},timeout=12,follow_redirects=False) as client:
+        next_slow=0
         while True:
-            now = int(time.time())
-            if now < next_slow and now < next_fast:
-                await asyncio.sleep(MARK_POLL)
-                continue
-            slow_due = now >= next_slow
-            errors = []
-            if slow_due:
-                await refresh_news(client)
-            if PRACTICE_VENUE == "COINBASE_US_FUTURES": await refresh_futures_budget(client)
-            for pair in PAIRS:
-                try:
-                    if slow_due:
-                        for interval in (300, 3600, 86400):
-                            rows = await fetch_bars(client, pair, interval)
-                            with db() as c: store_bars(c, pair, interval, rows)
-                    rows = await fetch_bars(client, pair, 60)
-                    with db() as c: store_bars(c, pair, 60, rows)
-                    quote = await fetch_quote(client, pair)
-                    mark_positions({pair: quote}, int(time.time()))
-                    # A qualified sniper has priority; both share one position per
-                    # market, cash, exposure, drawdown and five-trade daily ceiling.
-                    for strategy in STRATEGIES if slow_due else ("SNIPER_SCALP",):
-                        decision = decide(pair, quote, int(time.time()), strategy)
-                        log.info("PAPER %s %s %s: %s", strategy, pair, decision["status"], "; ".join(decision["reasons"]))
-                except Exception as exc:
-                    errors.append(pair + " strategy: " + type(exc).__name__)
-                    log.exception("Strategy scan failed: %s", pair)
-                    with db() as c:
-                        t = int(time.time())
-                        for strategy in STRATEGIES if slow_due else ("SNIPER_SCALP",):
-                            step = 60 if strategy == "SNIPER_SCALP" else 300
-                            c.execute("INSERT OR IGNORE INTO strategy_decisions VALUES (?,?,?,?,?,?,?,?)", (pair, strategy, t // step * step - step, t, "WAIT", None, json.dumps(["Strategy input failed: " + type(exc).__name__]), "{}"))
-            with db() as c:
-                put(c, "last_scan", iso())
-                put(c, "scalp_last_scan", iso())
-                put(c, "last_error", "; ".join(errors))
-                if not errors:
-                    put(c, "last_success", iso())
-                    put(c, "scalp_last_success", iso())
-                # Every fill/entry keeps its evidence. Repetitive WAIT history is bounded.
-                c.execute("DELETE FROM strategy_decisions WHERE status='WAIT' AND ts<? AND strategy='BREAKOUT'", (now - 30 * 86400,))
-                c.execute("DELETE FROM strategy_decisions WHERE status='WAIT' AND ts<? AND strategy='SNIPER_SCALP'", (now - 7 * 86400,))
-                c.execute("DELETE FROM equity WHERE ts<?", (now - 90 * 86400,))
-                c.execute("DELETE FROM bars WHERE ts<? AND interval IN (300,3600)", (now - 35 * 86400,))
-                c.execute("DELETE FROM bars WHERE ts<? AND interval=60", (now - 2 * 86400,))
-            if slow_due: next_slow = time.time() + POLL
-            next_fast = int(time.time() // 60) * 60 + 62
-            await asyncio.sleep(MARK_POLL)
+            slow_due=time.time()>=next_slow
+            try:await scan_once(client,slow_due)
+            except Exception:log.exception("Scanner iteration failed; retrying next minute")
+            if slow_due:next_slow=time.time()+POLL
+            await asyncio.sleep(max(1,int(time.time()//60)*60+62-time.time()))
 
 
 async def protective_monitor():
-    async with httpx.AsyncClient(headers={"User-Agent": "ChiefPaperProtection/2.0"}, timeout=8, follow_redirects=False) as client:
+    async with httpx.AsyncClient(headers={"User-Agent":"ChiefPaperProtection/2.5"},timeout=8,follow_redirects=False) as client:
         while True:
-            with db() as c: pairs = [r[0] for r in c.execute("SELECT pair FROM positions")]
-            quotes = {}
-            for pair in pairs:
-                try: quotes[pair] = await fetch_quote(client, pair)
-                except Exception:
-                    log.warning("Protective quote unavailable: %s; no invented fill", pair)
-            if quotes: mark_positions(quotes, int(time.time()))
+            try:
+                with db() as c:pairs=[r[0] for r in c.execute("SELECT pair FROM positions")]
+                quotes={}
+                for pair in pairs:
+                    try:quotes[pair]=await fetch_quote(client,pair)
+                    except Exception as exc:log.warning("Protective quote unavailable: %s: %s; no invented fill",pair,str(exc)[:120])
+                if quotes:mark_positions(quotes,int(time.time()))
+                with db() as c:put(c,"protection_heartbeat",iso());put(c,"protection_error","")
+            except Exception as exc:
+                log.exception("Protection iteration failed; retrying")
+                try:
+                    with db() as c:put(c,"protection_error",type(exc).__name__)
+                except Exception:pass
             await asyncio.sleep(MARK_POLL)
 
 
@@ -809,11 +915,18 @@ async def auth(req: Request, call_next):
 @app.get("/health")
 def health():
     with db() as c:
-        success, scan, err = get(c, "last_success"), get(c, "last_scan"), get(c, "last_error")
-        try: ok = time.time() - datetime.fromisoformat(success).timestamp() < max(900, POLL * 3) and not err
-        except (ValueError, TypeError): ok = False
-        n = news_context(c, PAIRS[0], int(time.time()))
-    return JSONResponse({"status": "ok" if ok else "degraded", "version": VERSION, "mode": "PAPER_ONLY", "live_trading": False, "practice_venue": PRACTICE_VENUE, "practice_starting_cash": START_CASH, "futures_execution_ready": PRACTICE_VENUE == "COINBASE_US_FUTURES", "last_scan": scan, "error": err, "capabilities": ["LONG", "SHORT", "CROSS_MARGIN_PAPER" if PRACTICE_VENUE == "COINBASE_US_FUTURES" else "SIMULATED_ISOLATED_MARGIN", "NEWS_GATES", "DURABLE_JOURNAL", "SNIPER_SCALP"], "strategies": STRATEGIES, "leverage": None if PRACTICE_VENUE == "COINBASE_US_FUTURES" else LEVERAGE, "news_ready": n["available"], "fee_rate": practice.TAKER_RATE if PRACTICE_VENUE == "COINBASE_US_FUTURES" else FEE, "slippage_model": futures.MODEL if PRACTICE_VENUE == "COINBASE_US_FUTURES" else "COINBASE_BOOK_VWAP", "additional_stress_rate": SLIPPAGE}, status_code=200 if ok else 503)
+        scan,err=get(c,"last_scan"),get(c,"last_error")
+        try:loop_ok=time.time()-datetime.fromisoformat(scan).timestamp()<180 and get(c,"scan_version")==VERSION
+        except (ValueError,TypeError):loop_ok=False
+        markets=json.loads(get(c,"market_status") or "{}")
+        inputs={pair:{"state":markets.get(pair,{}).get("state","WARMING"),"checked_at":markets.get(pair,{}).get("checked_at"),"errors":markets.get(pair,{}).get("errors",[])} for pair in PAIRS}
+        ready=sum(v["state"]=="READY" and time.time()-(v["checked_at"] or 0)<180 for v in inputs.values())
+        closed=sum(v["state"]=="SESSION_CLOSED" and time.time()-(v["checked_at"] or 0)<180 for v in inputs.values())
+        n=news_context(c,PAIRS[0],int(time.time()))
+        try:protection_ok=time.time()-datetime.fromisoformat(get(c,"protection_heartbeat")).timestamp()<45
+        except (ValueError,TypeError):protection_ok=False
+    ok=loop_ok and protection_ok and (ready>0 or closed==len(PAIRS))
+    return JSONResponse({"status":"ok" if ok else "degraded","version":VERSION,"mode":"PAPER_ONLY","live_trading":False,"practice_venue":PRACTICE_VENUE,"practice_starting_cash":START_CASH,"sizing_mode":SIZING_MODE,"signal_source":SIGNAL_SOURCE,"futures_execution_ready":PRACTICE_VENUE=="COINBASE_US_FUTURES","last_scan":scan,"scan_loop_ok":loop_ok,"protection_loop_ok":protection_ok,"strategies":STRATEGIES,"capabilities":["LONG","SHORT","CROSS_MARGIN_PAPER","NEWS_GATES","SNIPER_SCALP"],"markets_ready":ready,"markets_closed":closed,"market_inputs":inputs,"error":err,"news_ready":n["available"],"fee_rate":practice.TAKER_RATE if PRACTICE_VENUE=="COINBASE_US_FUTURES" else FEE,"slippage_model":futures.MODEL if PRACTICE_VENUE=="COINBASE_US_FUTURES" else "COINBASE_BOOK_VWAP","additional_stress_rate":SLIPPAGE},status_code=200 if ok else 503)
 
 
 def parsed_decision(row):
@@ -843,7 +956,7 @@ def dashboard():
             stats["win_rate"] = stats["wins"] / stats["completed"] * 100 if stats["completed"] else None
             strategy_results.append(stats)
         curve = [dict(e) for e in c.execute("SELECT * FROM equity ORDER BY ts DESC LIMIT 200")][::-1]
-        result = {"version": VERSION, "mode": "PAPER_ONLY", "account_profile": {"starting_cash": float(get(c, "starting_cash") or START_CASH), "target_balance_range": [80, 150], "practice_venue": PRACTICE_VENUE, "legacy_history_preserved": PRACTICE_VENUE == "COINBASE_US_FUTURES"}, "futures_budget": practice.report(json.loads(get(c, "futures_snapshots") or "{}"), max(.01, equity_value(c)), now) if PRACTICE_VENUE == "COINBASE_US_FUTURES" else None, "markets": PAIRS, "cash": round(float(get(c, "cash")), 6), "equity": round(equity_value(c), 6), "positions": positions, "trades": trades, "equity_history": curve, "last_scan": get(c, "last_scan"), "last_success": get(c, "last_success"), "last_mark": get(c, "last_mark"), "last_error": get(c, "last_error"), "entries_paused": bool(risk_blocks(c, now)), "pause_reasons": risk_blocks(c, now), "emergency_paused": get(c, "emergency_paused") == "true", "controls_supported": True, "fee_rate": FEE, "slippage_rate": SLIPPAGE, "slippage_model": "COINBASE_BOOK_VWAP", "fee_profile": {"market": "SPOT_PRICE_PROXY", "tier": "Intro", "order_type": "TAKER", "maker_rate": .005, "taker_rate": FEE, "source": FEE_SOURCE, "futures_reference": {"maker_rate": .00095, "taker_rate": .001, "additional_contract_charges": True, "applied": False}}, "journal": {"day": get(c, "day"), **dict(j), "limit": 5, "reserved": len(positions)}, "totals": totals, "strategy_results": strategy_results, "decisions": decisions, "news": {p: news_context(c, p, now) for p in PAIRS}, "settings": {"leverage": LEVERAGE, "max_leverage": 3, "risk_per_trade_pct": RISK * 100, "daily_loss_pct": DAILY_LOSS * 100, "stop_pct": STOP * 100, "target_r": 2, "mark_poll_seconds": MARK_POLL, "holding_cost_per_8h": HOLDING_RATE, "maintenance_margin_rate": MAINTENANCE, "max_positions": 2, "scalp_risk_pct": SCALP_RISK * 100, "scalp_max_hold_seconds": SCALP_MAX_HOLD, "scalp_min_net_rr": 2, "scalp_scan_seconds": 60}, "disclosure": "Synthetic isolated-margin simulation on Coinbase SPOT prices, not a Coinbase derivatives account. Entry/exit fills use size-weighted Coinbase spot book depth and the verified-account taker-fee snapshot. Optional additional stress is separate. Snapshot depth is not a guaranteed future fill; unseen market changes can add slippage. Assumed holding cost on both sides, not actual funding. Stops/targets sampled about every 5s; fast crossings can be missed and outages delay exits. Liquidation is an assumed model, not exchange rules. Sniper is a fixed-rule paper strategy, not a trained predictive model. No historical news backtest or profitability claim."}
+        result = {"version": VERSION, "mode": "PAPER_ONLY", "account_profile": {"starting_cash": float(get(c, "starting_cash") or START_CASH), "target_balance_range": [80, 150], "practice_venue": PRACTICE_VENUE, "legacy_history_preserved": PRACTICE_VENUE == "COINBASE_US_FUTURES", "sizing_mode": SIZING_MODE, "signal_source": SIGNAL_SOURCE}, "futures_budget": practice.report(json.loads(get(c, "futures_snapshots") or "{}"), max(.01, equity_value(c)), now) if PRACTICE_VENUE == "COINBASE_US_FUTURES" else None, "markets": PAIRS, "cash": round(float(get(c, "cash")), 6), "equity": round(equity_value(c), 6), "positions": positions, "trades": trades, "equity_history": curve, "last_scan": get(c, "last_scan"), "last_success": get(c, "last_success"), "last_mark": get(c, "last_mark"), "last_error": get(c, "last_error"), "entries_paused": bool(risk_blocks(c, now)), "pause_reasons": risk_blocks(c, now), "emergency_paused": get(c, "emergency_paused") == "true", "controls_supported": True, "fee_rate": FEE, "slippage_rate": SLIPPAGE, "slippage_model": "COINBASE_BOOK_VWAP", "fee_profile": {"market": "SPOT_PRICE_PROXY", "tier": "Intro", "order_type": "TAKER", "maker_rate": .005, "taker_rate": FEE, "source": FEE_SOURCE, "futures_reference": {"maker_rate": .00095, "taker_rate": .001, "additional_contract_charges": True, "applied": False}}, "journal": {"day": get(c, "day"), **dict(j), "limit": 5, "reserved": len(positions)}, "totals": totals, "strategy_results": strategy_results, "decisions": decisions, "news": {p: news_context(c, p, now) for p in PAIRS}, "settings": {"leverage": LEVERAGE, "max_leverage": 3, "risk_per_trade_pct": RISK * 100, "daily_loss_pct": DAILY_LOSS * 100, "stop_pct": STOP * 100, "target_r": 2, "mark_poll_seconds": MARK_POLL, "holding_cost_per_8h": HOLDING_RATE, "maintenance_margin_rate": MAINTENANCE, "max_positions": 2, "scalp_risk_pct": SCALP_RISK * 100, "scalp_max_hold_seconds": SCALP_MAX_HOLD, "scalp_min_net_rr": 2, "scalp_scan_seconds": 60}, "disclosure": "Synthetic isolated-margin simulation on Coinbase SPOT prices, not a Coinbase derivatives account. Entry/exit fills use size-weighted Coinbase spot book depth and the verified-account taker-fee snapshot. Optional additional stress is separate. Snapshot depth is not a guaranteed future fill; unseen market changes can add slippage. Assumed holding cost on both sides, not actual funding. Stops/targets sampled about every 5s; fast crossings can be missed and outages delay exits. Liquidation is an assumed model, not exchange rules. Sniper is a fixed-rule paper strategy, not a trained predictive model. No historical news backtest or profitability claim."}
 
         if PRACTICE_VENUE == "COINBASE_US_FUTURES":
             result.update(fee_rate=practice.TAKER_RATE, slippage_model=futures.MODEL, disclosure=futures.DISCLOSURE)
@@ -851,6 +964,9 @@ def dashboard():
             result["settings"].update(holding_cost_per_8h=0,maintenance_margin_rate=None,leverage=None,max_leverage=None,margin_model="HIGHER_PUBLISHED_INITIAL_RATE",settlement_model="PAPER_DAILY_VARIATION_ESTIMATE")
             result["settlements"]=[dict(row) for row in c.execute("SELECT * FROM futures_settlements ORDER BY id DESC LIMIT 50")]
             result["margin_guard"]={"required":sum(p["margin"]+futures.fee(p["contracts"],p["contract_size"],p["mark"]) for p in positions if p["model"]==futures.MODEL),"equity":equity_value(c),"policy":"Account-wide conservative initial-margin proxy; not actual liquidation margin"}
+        result["market_status"]=json.loads(get(c,"market_status") or "{}")
+        result["activity"]={"state":"IN_TRADE" if positions else "PAUSED" if result["entries_paused"] else "SCANNING", "open_positions":len(positions), "latest_fill_at":trades[0]["ts"] if trades else None}
+        result["settings"].update(sizing_mode=SIZING_MODE,signal_source=SIGNAL_SOURCE,risk_limit_enforced=SIZING_MODE!="FULL_MARGIN",max_positions=1 if SIZING_MODE=="FULL_MARGIN" else 2)
         return result
 
 
@@ -901,3 +1017,4 @@ async function refresh(){try{let r=await fetch('/api/dashboard',{cache:'no-store
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(HTML)
+

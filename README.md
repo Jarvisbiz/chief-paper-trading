@@ -1,4 +1,4 @@
-# Chief Paper Gym v2.4 · U.S. nano-futures
+# Chief Paper Gym v2.5 · U.S. nano-futures
 
 Private, paper-only BTC/ETH/SOL practice. No exchange credentials, private
 exchange API, order endpoint, transfers or live trading. The owner selected
@@ -7,6 +7,7 @@ Coinbase U.S. futures with an $80–$150 intended starting range.
 ## Active account and history
 
 Production uses `PAPER_PRACTICE_VENUE=COINBASE_US_FUTURES`,
+`PAPER_SIGNAL_SOURCE=SPOT_REFERENCE`, `PAPER_SIZING_MODE=FULL_MARGIN`,
 `PAPER_STARTING_CASH=80`, `DB_PATH=/data/chief-practice-80.sqlite` on the
 existing mounted volume. Earlier `/data/chief.sqlite` history stays intact.
 Initialization migrates schemas in place and never resets cash or tops up losses.
@@ -18,12 +19,20 @@ those comparisons are affordability floors, not three independent performance ru
 - Select the nearest dated nano BIT / ET / SOL contract more than 24h from expiry
   using public Coinbase product metadata. Perpetual-style products are excluded;
   dated contracts have no perpetual funding or assumed holding charge.
-- Strategy candles and fills use that contract's identity, never spot prices.
+- Setup signals use continuous liquid spot-reference candles stored separately
+  in `signal_bars`. Futures fills always use the actual contract book. Both fresh
+  prices map structural levels by their current price ratio; >2% basis, wrong
+  identity or stale paired quotes block entries. Original reference levels, ratio,
+  quote times and mapped levels are retained with the entry evidence.
+- Contract candle gaps from sparse trading remain historical chart evidence,
+  separate from setup readiness; no trade or volume is fabricated.
   A held contract is pinned across metadata refreshes; selection can roll only
   while flat. Rollover clears old candle history, not fills or accounting records.
 - Validate product ID, contract multiplier, whole minimum/increment, maximum
   contracts, tick size, expiry, market-order restrictions and session state.
-  Metadata expires after 600s, books after 10s. Missing inputs mean WAIT.
+  Metadata expires after 600s, books after 10s. Book reads use cache-busting and
+  one bounded retry; timestamps are never overwritten or freshness relaxed.
+  Missing inputs mean WAIT with a structured per-market reason.
 - Convert order-book contract quantities to underlying units; walk fresh bids/asks
   for the full whole-contract size, then apply optional extra stress. Spread and
   depth impact enter once. Insufficient depth never invents a complete fill.
@@ -31,10 +40,16 @@ those comparisons are affordability floors, not three independent performance ru
   $0.15/contract per side. Paper market fills pay taker. Snapshot checked November
   6, 2026 America/Chicago, not automatically refreshed from a private account.
   Maker fills are not fabricated; recheck the snapshot when the tier changes.
-- Risk <=0.25% equity for Sniper / <=0.5% for Breakout, including planned stop,
-  both fees and estimated depth impact. Whole counts round down, never up. Gross
-  exposure <=2x total equity, max two markets, one position per market, combined
-  five daily entries/completions with open-slot reservation. Five is a ceiling.
+- Selected FULL_MARGIN paper mode uses the maximum affordable whole-contract
+  count with entry/exit-fee reserves and one global position. Remainders stay
+  unused; whole contracts cannot consume an exact percentage of cash. Structural
+  stops, >=2R net scalp gate and daily drawdown halt remain active; the old
+  0.25%/0.5% per-trade caps and 2x-equity gross ceiling do not apply in FULL_MARGIN.
+  Planned dollar loss and equity/margin percentages are recorded explicitly.
+- Optional RISK_LIMITED mode retains <=0.25% scalp / <=0.5% Breakout planned risk,
+  <=2x-equity gross exposure and max two markets. Both modes use whole counts,
+  one position per market, combined five daily entries/completions and open-slot
+  reservation. Five is a ceiling. No real allocation or order access exists.
 - Higher of current published intraday/overnight initial margin by direction is
   reserved throughout. No intraday opt-in, margin offsets, isolated-loss cap or
   invented fixed leverage. Account equity and cash deficits can go negative.
@@ -122,3 +137,17 @@ Primary references:
 - https://help.coinbase.com/en/coinbase/derivatives/us-derivatives-leverage-margin
 - https://help.coinbase.com/en/coinbase/derivatives/us-derivatives-risk-management-and-liquidations
 - https://www.coinbase.com/advanced-vip
+
+
+## Readiness, recovery and visible activity
+
+`scan_once` isolates reference inputs, contract chart evidence and fresh quotes.
+Expected stale quotes become per-market DATA_BLOCKED rather than uncaught scan
+errors; successful markets continue. Repeated input errors cannot overwrite a
+recorded OPEN decision. Both scan and protection loops retry after exceptions.
+Health verifies current-build scan heartbeat, protection heartbeat, and at least
+one data-ready market; it exposes each market's status rather than implying
+that a running process guarantees ready signals. Authenticated dashboard adds
+market_status, signal-source/sizing-mode fields and current activity. The UI
+shows IN A PAPER TRADE / NO OPEN PAPER TRADE plus stale status and real positions.
+No test fixture or fabricated entry is copied into the production journal.

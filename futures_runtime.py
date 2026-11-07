@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import practice_budget as contract
 
 MODEL = 'US_FUTURES_BOOK_VWAP'
-DISCLOSURE = ('Dated Coinbase U.S. nano-futures PAPER simulation: whole contracts, actual contract books/candles, '
+DISCLOSURE = ('Dated Coinbase U.S. nano-futures PAPER simulation: whole contracts and actual contract books, with separately labeled spot-reference or contract setup candles, '
  'verified FUTURE taker-fee snapshot plus published contract charge. No real orders. Higher intraday/overnight '
  'initial margin is used throughout; no intraday opt-in or offsets assumed. Account-wide margin protection '
  'uses this initial requirement as a conservative maintenance proxy, not Coinbase liquidation rules. Losses '
@@ -53,16 +53,22 @@ def plan(e, c, pair, direction, q, evidence, now):
     try: s = quote_spec(e, c, pair, q, now, True)
     except ValueError as exc: return None, str(exc)
     if direction not in ('LONG','SHORT'): return None, 'Confirmed futures direction unavailable'
+    if e.SIGNAL_SOURCE == 'SPOT_REFERENCE':
+        basis=evidence.get('basis',{})
+        ref=q.get('signal_quote',{})
+        if evidence.get('signal_source')!='COINBASE_SPOT_REFERENCE' or not basis or not ref or evidence.get('reference_pair')!=pair or ref.get('product_id')!=pair or any(not -5<=now-basis.get(k,0)<=10 for k in ('spot_ts','futures_ts')) or not -5<=now-ref.get('ts',0)<=10 or abs(basis.get('ratio',0)-1)>.02 or basis.get('spot_price')!=ref.get('price') or basis.get('futures_price')!=q.get('price') or abs(basis.get('ratio',0)-q['price']/ref['price'])>1e-10:
+            return None,'Validated paired-price signal mapping is required'
+    full=e.SIZING_MODE=='FULL_MARGIN'
     sign = e.direction_sign(direction)
     strategy = evidence.get('strategy', 'BREAKOUT')
-    risk_rate = e.SCALP_RISK if strategy == 'SNIPER_SCALP' else e.RISK
+    risk_rate = None if full else e.SCALP_RISK if strategy == 'SNIPER_SCALP' else e.RISK
     eq, cash = e.equity_value(c), float(e.get(c,'cash'))
     if eq <= 0: return None, 'Paper futures equity is exhausted; no new entries'
     rows = [dict(p) for p in c.execute('SELECT * FROM positions')]
     exposure = sum(p['qty']*p['mark'] for p in rows)
     exit_reserve = sum(fee(p['contracts'],p['contract_size'],p['mark']) for p in rows if p['model']==MODEL)
     size, minimum, step, rate = s['contract_size'],s['minimum_contracts'],s['contract_increment'],s['margin_rates'][direction.lower()]
-    upper = min(s.get('max_contracts',5000), int(max(0., eq*2-exposure)/(size*q['price'])))
+    upper = min(s.get('max_contracts',5000),int(max(0.,cash-exit_reserve)/(size*q['price']*(rate+2*contract.TAKER_RATE)+2*contract.CONTRACT_CHARGE))) if full else min(s.get('max_contracts',5000),int(max(0.,eq*2-exposure)/(size*q['price'])))
     best, first_reason = None, None
     for count in range(minimum, upper+1, step):
         qty=count*size
@@ -92,17 +98,17 @@ def plan(e, c, pair, direction, q, evidence, now):
         rr=reward/loss if loss>0 else 0
         reasons=[]
         if not sign*(entry-stop)>0 or not sign*(target-entry)>0 or loss<=0 or reward<=0: reasons.append('Futures protective levels have no positive net reward')
-        if loss>eq*risk_rate+1e-9: reasons.append(f'Minimum whole-contract planned loss ${loss:.2f} exceeds ${eq*risk_rate:.2f} risk allowance')
+        if not full and loss>eq*risk_rate+1e-9: reasons.append(f'Minimum whole-contract planned loss ${loss:.2f} exceeds ${eq*risk_rate:.2f} risk allowance')
         if margin+entry_fee+reserve>cash-exit_reserve+1e-9: reasons.append('Whole contract exceeds free margin plus both-fee reserve')
         if strategy=='SNIPER_SCALP' and rr<2: reasons.append(f'Sniper futures net reward/risk {rr:.2f}R is below 2R after costs')
-        result={'product_id':s['product_id'],'strategy':strategy,'contracts':count,'contract_size':size,'qty':qty,'entry_estimate':entry,'entry_fee':entry_fee,'stop':stop,'target':target,'risk_amount':loss,'risk_rate':risk_rate,'risk_fraction':loss/(entry*qty),'reward_amount':reward,'net_rr':rr,'margin':margin,'margin_rate':rate,'leverage':1/rate,'projected_exit_book_impact_pct':impact*100,'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'book_time':e.iso(q['ts']),'max_hold_seconds':e.SCALP_MAX_HOLD if strategy=='SNIPER_SCALP' else None}
+        result={'sizing_mode':e.SIZING_MODE,'risk_pct_of_equity':loss/eq*100,'margin_pct_of_equity':margin/eq*100,'product_id':s['product_id'],'strategy':strategy,'contracts':count,'contract_size':size,'qty':qty,'entry_estimate':entry,'entry_fee':entry_fee,'stop':stop,'target':target,'risk_amount':loss,'risk_rate':risk_rate,'risk_fraction':loss/(entry*qty),'reward_amount':reward,'net_rr':rr,'margin':margin,'margin_rate':rate,'leverage':1/rate,'projected_exit_book_impact_pct':impact*100,'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'book_time':e.iso(q['ts']),'max_hold_seconds':e.SCALP_MAX_HOLD if strategy=='SNIPER_SCALP' else None}
         if reasons:
             first_reason=first_reason or '; '.join(reasons)
             if best is None: best=result
             break
         best=result;best['passes']=True
     if best and best.get('passes'): return best,None
-    return best,first_reason or 'Minimum whole futures contract exceeds the 2x-equity gross exposure ceiling'
+    return best,first_reason or ('Minimum whole contract exceeds available margin and fee reserves' if full else 'Minimum whole futures contract exceeds the 2x-equity gross exposure ceiling')
 
 
 def open_position(e,c,pair,direction,q,evidence,now):
@@ -112,7 +118,7 @@ def open_position(e,c,pair,direction,q,evidence,now):
     p,error=plan(e,c,pair,direction,q,evidence,now)
     if error:return error
     s=q['contract'];strategy=evidence.get('strategy','BREAKOUT');sign=e.direction_sign(direction)
-    evidence={**evidence,'strategy':strategy,'plan':p,'product_id':s['product_id'],'planned_risk_amount':p['risk_amount'],'execution':{'model':MODEL,'book_time':e.iso(q['ts']),'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'contracts':p['contracts'],'contract_size':p['contract_size'],'additional_stress_rate':e.SLIPPAGE}}
+    evidence={**evidence,'strategy':strategy,'plan':p,'product_id':s['product_id'],'planned_risk_amount':p['risk_amount'],'execution':{'model':MODEL,'book_time':e.iso(q['ts']),'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'contracts':p['contracts'],'contract_size':p['contract_size'],'sizing_mode':e.SIZING_MODE,'additional_stress_rate':e.SLIPPAGE}}
     payload=json.dumps(evidence,separators=(',',':'))
     e.put(c,'cash',float(e.get(c,'cash'))-p['margin']-p['entry_fee'])
     expiry=now+e.SCALP_MAX_HOLD if strategy=='SNIPER_SCALP' else None
@@ -205,3 +211,4 @@ def mark_positions(e,quotes,now):
         e.roll_day(c,now)
         c.execute('INSERT OR REPLACE INTO equity VALUES (?,?,?)',(now,e.equity_value(c),float(e.get(c,'cash'))))
         if valid:e.put(c,'last_mark',e.iso(now))
+

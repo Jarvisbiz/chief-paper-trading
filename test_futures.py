@@ -17,6 +17,8 @@ from test_budget import product
 @pytest.fixture(autouse=True)
 def venue(monkeypatch):
     monkeypatch.setattr(e,'PRACTICE_VENUE','COINBASE_US_FUTURES')
+    monkeypatch.setattr(e,'SIGNAL_SOURCE','CONTRACT')
+    monkeypatch.setattr(e,'SIZING_MODE','RISK_LIMITED')
 
 
 def inputs(now=None,price=2000,side='LONG'):
@@ -212,3 +214,4 @@ def test_quiet_valid_futures_candles_are_not_fabricated_or_transport_failure():
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:httpx.Response(200,json={'candles':[]}))) as client:
             assert await e.fetch_bars(client,'ETH-USD',60)==[]
     asyncio.run(run())
+
