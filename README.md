@@ -151,3 +151,16 @@ that a running process guarantees ready signals. Authenticated dashboard adds
 market_status, signal-source/sizing-mode fields and current activity. The UI
 shows IN A PAPER TRADE / NO OPEN PAPER TRADE plus stale status and real positions.
 No test fixture or fabricated entry is copied into the production journal.
+
+
+## v2.6 — $250 forward practice and expanded dated crypto
+
+The owner selected a new $250 paper run. Production DB is `/data/chief-practice-250.sqlite`; the earlier $80 and $500 databases stay intact and are not blended into current results. Restarts never refill cash. $280 appears only as a comparison, not a deposit or minimum recommendation.
+
+Fourteen verified dated crypto roots: BTC/BIT, ETH/ET, SOL, XRP, ADA, AVAX/AVA, BCH, DOGE/DOG, DOT, HBAR/HED, LTC/LC, LINK/LNK, SUI, XLM. Public product catalogs are paginated; fresh detail snapshots supply whole-contract size, tick, side-specific margin and session state. Published overnight/intraday maximum margin remains conservative, including on weekends. No arbitrary 10x or 15x is fabricated. Perpetuals with funding, including compatibility reference-expiry contracts, are explicitly excluded until a historical funding adapter exists; BNB/HYPE references and the SHIB price-unit adapter are also unsupported. Catalog presence is not a statement of live account eligibility.
+
+Scans run server-side, three markets at a time. Data outages block the affected market. Strategy decisions are committed atomically against shared one-position full-margin limits. Sniper and ORB scan every completed minute; the slower breakout refreshes at the slow cadence. No trades are forced to populate an empty journal.
+
+ORB is an explicitly labeled default variant, not recalled private historical rules: weekdays New York 09:30–09:45 opening range; entries 09:45–11:30; complete range, completed break then retest, 1H/5M trend alignment and 1.2x entry volume. Structural stop 0.1–0.8%, range/volatility bounded target, 2R net minimum, +1R cost-adjusted breakeven, 30-minute deadline. It shares news, actual futures book execution, fee reserves and daily halt. Sniper retains its 15-minute deadline. Local fixture round trips test both directions without inserting test fills into production.
+
+Dashboard exposes side-specific leverage, one-contract margin/fee floors, $250/$280 whole-lot comparisons and current-equity capacity. Affordability is never a signal or evidence of small loss. Quick profits are not promised. All exchange requests remain public GET reads; this release has no real-order path.

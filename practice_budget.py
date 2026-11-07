@@ -2,7 +2,12 @@
 import math
 from datetime import datetime
 
-ROOTS = {'BTC-USD': 'BIT', 'ETH-USD': 'ET', 'SOL-USD': 'SOL'}
+# Explicit verified crypto roots. Never discover non-crypto products by FUTURE alone.
+ROOTS = {'BTC-USD':'BIT', 'ETH-USD':'ET', 'SOL-USD':'SOL', 'XRP-USD':'XRP',
+         'ADA-USD':'ADA', 'AVAX-USD':'AVA', 'BCH-USD':'BCH', 'DOGE-USD':'DOG',
+         'DOT-USD':'DOT', 'HBAR-USD':'HED', 'LTC-USD':'LC', 'LINK-USD':'LNK',
+         'SUI-USD':'SUI', 'XLM-USD':'XLM'}
+UNSUPPORTED = 'Perpetuals require a separate historical funding adapter; BNB/HYPE lack a verified Coinbase spot reference here; SHIB requires a 1,000-token price-unit adapter. These products cannot receive paper fills in this release.'
 TAKER_RATE = .001
 CONTRACT_CHARGE = .15
 FEE_SOURCE = 'Coinbase FUTURE Intro account snapshot + published $0.15/contract, checked 2026-11-07 UTC'
@@ -13,6 +18,12 @@ def contract_snapshot(product, now, held=False):
     pair = next((pair for pair, root in ROOTS.items() if pid.startswith(root + '-')), None)
     if not pair or product.get('product_type') != 'FUTURE': raise ValueError('Unsupported futures product')
     details = product['future_product_details']
+    if details.get('non_crypto') is True or details.get('contract_root_unit') not in (None,'',pair.split('-')[0]):
+        raise ValueError('Futures underlying unit does not match the verified crypto reference')
+    # CDE perpetuals can report EXPIRING with a compatibility reference expiry.
+    # Funding terms, not the legacy ID suffix, identify this unsupported class.
+    if details.get('funding_interval') or details.get('funding_rate') not in (None,'') or details.get('contract_expiry_type') == 'PERPETUAL':
+        raise ValueError('Perpetual funding adapter unavailable; cannot treat this as a dated contract')
     expiry = datetime.fromisoformat(details['contract_expiry'].replace('Z', '+00:00')).timestamp()
     if not held and expiry <= now + 86400: raise ValueError('Contract near expiry; no inferred rollover')
     size, price, minimum, increment = map(float, (details['contract_size'], product['price'], product['base_min_size'], product['base_increment']))
@@ -55,6 +66,27 @@ def report(snapshots, balance, now):
     for pair in ROOTS:
         snapshot = snapshots.get(pair)
         directions = {direction: assess(snapshot, balance, direction, now=now) for direction in ('LONG', 'SHORT')}
-        comparisons = {str(int(b)): assess(snapshot, b, now=now) for b in (80., 100., 150.)}
-        rows.append({'pair': pair, 'directions': directions, 'comparisons': comparisons})
-    return {'venue': 'COINBASE_US_FUTURES', 'execution_ready': True, 'fee_source': FEE_SOURCE, 'taker_rate': TAKER_RATE, 'contract_charge_per_side': CONTRACT_CHARGE, 'margin_policy': 'Higher of published intraday/overnight rates; no assumed intraday opt-in or offsets', 'example_stop_pct': .3, 'example_risk_pct': .25, 'rows': rows, 'disclosure': 'Affordability floor, not a trade signal or performance forecast. Uses dated nano contracts and latest quoted product price. This table excludes spread/depth; actual paper orders separately walk contract books and enforce risk. Liquidation surcharges remain unmodeled. Daily paper variation transfers are estimates, not official clearing. Actual account order preview controls; no spot-proxy fills.'}
+        comparisons = {str(int(b)): assess(snapshot, b, now=now) for b in (250., 280.)}
+        rows.append({'pair': pair, 'directions': directions, 'comparisons': comparisons, 'allocations': {str(int(b)): {d: allocation(snapshot,b,d,now) for d in ('LONG','SHORT')} for b in (250.,280.)}, 'current_allocation': {d: allocation(snapshot,balance,d,now) for d in ('LONG','SHORT')}})
+    return {'venue': 'COINBASE_US_FUTURES', 'execution_ready': True, 'unsupported_products': UNSUPPORTED, 'comparison_balances': [250,280], 'fee_source': FEE_SOURCE, 'taker_rate': TAKER_RATE, 'contract_charge_per_side': CONTRACT_CHARGE, 'margin_policy': 'Higher of published intraday/overnight rates; no assumed intraday opt-in or offsets', 'example_stop_pct': .3, 'example_risk_pct': .25, 'rows': rows, 'disclosure': 'Affordability floor, not a trade signal or performance forecast. Uses dated nano contracts and latest quoted product price. This table excludes spread/depth; actual paper orders separately walk contract books and enforce risk. Liquidation surcharges remain unmodeled. Daily paper variation transfers are estimates, not official clearing. Actual account order preview controls; no spot-proxy fills.'}
+
+
+
+def allocation(snapshot, balance, direction, now):
+    """Margin/fees only; never mislabel affordable as a valid entry or safe risk."""
+    if not snapshot or not -5 <= now-snapshot.get('observed_at',0) <= 600:
+        return {'available':False,'reason':'Fresh contract specifications unavailable'}
+    rate=snapshot['margin_rates'][direction.lower()]
+    per=snapshot['contract_size']*snapshot['price']
+    margin=per*rate
+    fees=2*(per*TAKER_RATE+CONTRACT_CHARGE)
+    step=snapshot['contract_increment']; minimum=snapshot['minimum_contracts']
+    upper=min(snapshot['max_contracts'],int(max(0,balance)/(margin+fees)))
+    count=minimum+(upper-minimum)//step*step if upper>=minimum else 0
+    floor=(margin+fees)*minimum
+    return {'available':True,'balance':balance,'leverage':1/rate,'minimum_margin':margin*minimum,
+            'minimum_fee_reserve':fees*minimum,'minimum_cash_floor':floor,
+            'max_contracts':count,'remaining_after_minimum':balance-floor,
+            'affordable':count>=minimum,'session_open':snapshot['session_open'],
+            'market_orders_allowed':snapshot['market_orders_allowed'],
+            'disclosure':'Indicative margin and both-fee reserve only. Actual book depth, stop risk, news and session checks still control every entry.'}

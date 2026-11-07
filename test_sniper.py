@@ -115,11 +115,13 @@ def test_future_confirmation_and_gaps_do_not_create_a_setup():
         assert not e.scalp_evidence(c,"BTC-USD",now)["technical_pass"]
 
 
-def test_two_strategies_keep_separate_decisions_but_share_positions_and_risk(monkeypatch):
+def test_strategies_keep_separate_decisions_but_share_positions_and_risk(monkeypatch):
     lower_fee_fixture(monkeypatch);now,q,_=setup_market();neutral_news(now)
     e.decide("BTC-USD",q,now,"SNIPER_SCALP")
     other=e.decide("BTC-USD",q,now,"BREAKOUT")
     assert other["status"]=="WAIT" and any("already open" in r for r in other["reasons"])
+    orb=e.decide("BTC-USD",q,now,"ORB")
+    assert orb["status"]=="WAIT"
     d=e.dashboard();assert len(d["positions"])==1
     assert {v["strategy"] for v in d["decisions"]}==set(e.STRATEGIES)
     assert sum(s["entries"] for s in d["strategy_results"])==1
@@ -151,3 +153,4 @@ def test_five_trade_ceiling_is_combined_not_five_per_strategy():
         for strategy in ["BREAKOUT"]*3+["SNIPER_SCALP"]*2:
             c.execute("INSERT INTO trades(ts,pair,side,qty,price,fee,reason,pnl,action,strategy) VALUES (?,'BTC-USD','BUY',1,100,0,'fixture',NULL,'OPEN_LONG',?)",(now,strategy))
         assert any("Five-trade" in r for r in e.risk_blocks(c,now))
+

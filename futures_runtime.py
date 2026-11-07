@@ -61,7 +61,8 @@ def plan(e, c, pair, direction, q, evidence, now):
     full=e.SIZING_MODE=='FULL_MARGIN'
     sign = e.direction_sign(direction)
     strategy = evidence.get('strategy', 'BREAKOUT')
-    risk_rate = None if full else e.SCALP_RISK if strategy == 'SNIPER_SCALP' else e.RISK
+    label='ORB' if strategy=='ORB' else 'Sniper'
+    risk_rate = None if full else e.SCALP_RISK if strategy in ('SNIPER_SCALP','ORB') else e.RISK
     eq, cash = e.equity_value(c), float(e.get(c,'cash'))
     if eq <= 0: return None, 'Paper futures equity is exhausted; no new entries'
     rows = [dict(p) for p in c.execute('SELECT * FROM positions')]
@@ -77,12 +78,12 @@ def plan(e, c, pair, direction, q, evidence, now):
             impact=e.impact_rate(q,'SELL' if sign==1 else 'BUY',qty=qty)
         except ValueError as exc:
             first_reason=first_reason or str(exc);break
-        if strategy=='SNIPER_SCALP':
+        if strategy in ('SNIPER_SCALP','ORB'):
             if not all(k in evidence for k in ('structural_stop','opposite_range_level','atr_5m')):
-                return None,'Sniper futures structural evidence unavailable'
+                return None,f'{label} futures structural evidence unavailable'
             stop=tick(evidence['structural_stop'],s['tick_size'],up=sign==-1)
             distance=sign*(entry-stop)/entry
-            if not .001<=distance<=.008: return None,'Sniper: futures stop must be 0.1–0.8% from fill'
+            if not .001<=distance<=.008: return None,f'{label}: futures stop must be 0.1–0.8% from fill'
             move=min(sign*(evidence['opposite_range_level']-entry)*.95,evidence['atr_5m']*2)
             target=tick(entry+sign*move,s['tick_size'],up=sign==-1)
         else:
@@ -100,8 +101,8 @@ def plan(e, c, pair, direction, q, evidence, now):
         if not sign*(entry-stop)>0 or not sign*(target-entry)>0 or loss<=0 or reward<=0: reasons.append('Futures protective levels have no positive net reward')
         if not full and loss>eq*risk_rate+1e-9: reasons.append(f'Minimum whole-contract planned loss ${loss:.2f} exceeds ${eq*risk_rate:.2f} risk allowance')
         if margin+entry_fee+reserve>cash-exit_reserve+1e-9: reasons.append('Whole contract exceeds free margin plus both-fee reserve')
-        if strategy=='SNIPER_SCALP' and rr<2: reasons.append(f'Sniper futures net reward/risk {rr:.2f}R is below 2R after costs')
-        result={'sizing_mode':e.SIZING_MODE,'risk_pct_of_equity':loss/eq*100,'margin_pct_of_equity':margin/eq*100,'product_id':s['product_id'],'strategy':strategy,'contracts':count,'contract_size':size,'qty':qty,'entry_estimate':entry,'entry_fee':entry_fee,'stop':stop,'target':target,'risk_amount':loss,'risk_rate':risk_rate,'risk_fraction':loss/(entry*qty),'reward_amount':reward,'net_rr':rr,'margin':margin,'margin_rate':rate,'leverage':1/rate,'projected_exit_book_impact_pct':impact*100,'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'book_time':e.iso(q['ts']),'max_hold_seconds':e.SCALP_MAX_HOLD if strategy=='SNIPER_SCALP' else None}
+        if strategy in ('SNIPER_SCALP','ORB') and rr<2: reasons.append(f'{label} futures net reward/risk {rr:.2f}R is below 2R after costs')
+        result={'sizing_mode':e.SIZING_MODE,'risk_pct_of_equity':loss/eq*100,'margin_pct_of_equity':margin/eq*100,'product_id':s['product_id'],'strategy':strategy,'contracts':count,'contract_size':size,'qty':qty,'entry_estimate':entry,'entry_fee':entry_fee,'stop':stop,'target':target,'risk_amount':loss,'risk_rate':risk_rate,'risk_fraction':loss/(entry*qty),'reward_amount':reward,'net_rr':rr,'margin':margin,'margin_rate':rate,'leverage':1/rate,'projected_exit_book_impact_pct':impact*100,'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'book_time':e.iso(q['ts']),'max_hold_seconds':(e.ORB_MAX_HOLD if strategy=='ORB' else e.SCALP_MAX_HOLD) if strategy in ('SNIPER_SCALP','ORB') else None}
         if reasons:
             first_reason=first_reason or '; '.join(reasons)
             if best is None: best=result
@@ -121,9 +122,9 @@ def open_position(e,c,pair,direction,q,evidence,now):
     evidence={**evidence,'strategy':strategy,'plan':p,'product_id':s['product_id'],'planned_risk_amount':p['risk_amount'],'execution':{'model':MODEL,'book_time':e.iso(q['ts']),'fee_rate':contract.TAKER_RATE,'contract_charge_per_side':contract.CONTRACT_CHARGE,'fee_source':contract.FEE_SOURCE,'contracts':p['contracts'],'contract_size':p['contract_size'],'sizing_mode':e.SIZING_MODE,'additional_stress_rate':e.SLIPPAGE}}
     payload=json.dumps(evidence,separators=(',',':'))
     e.put(c,'cash',float(e.get(c,'cash'))-p['margin']-p['entry_fee'])
-    expiry=now+e.SCALP_MAX_HOLD if strategy=='SNIPER_SCALP' else None
+    expiry=now+(e.ORB_MAX_HOLD if strategy=='ORB' else e.SCALP_MAX_HOLD) if strategy in ('SNIPER_SCALP','ORB') else None
     c.execute('INSERT INTO positions(pair,qty,entry,entry_fee,stop,peak,opened,direction,leverage,margin,target,initial_stop,funding,funding_at,evidence,mark,mark_ts,strategy,expires,risk_amount,model,product_id,contracts,contract_size,settlement_basis,vm_total,settlement_cycle,margin_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(pair,p['qty'],p['entry_estimate'],p['entry_fee'],p['stop'],p['entry_estimate'],now,direction,p['leverage'],p['margin'],p['target'],p['stop'],0,now,payload,q['price'],q['ts'],strategy,expiry,p['risk_amount'],MODEL,p['product_id'],p['contracts'],p['contract_size'],p['entry_estimate'],0,settlement_cycle(now),p['margin_rate']))
-    reason='sniper_sweep_retest' if strategy=='SNIPER_SCALP' else 'news_aware_breakout' if sign==1 else 'news_aware_breakdown'
+    reason='orb_break_retest' if strategy=='ORB' else 'sniper_sweep_retest' if strategy=='SNIPER_SCALP' else 'news_aware_breakout' if sign==1 else 'news_aware_breakdown'
     c.execute('INSERT INTO trades(ts,pair,side,qty,price,fee,reason,pnl,direction,action,leverage,margin,funding,evidence,strategy,risk_amount,model,product_id,contracts,contract_size) VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?,0,?,?,?,?,?,?,?)',(now,pair,'BUY' if sign==1 else 'SELL',p['qty'],p['entry_estimate'],p['entry_fee'],reason,direction,'OPEN_'+direction,p['leverage'],p['margin'],payload,strategy,p['risk_amount'],MODEL,p['product_id'],p['contracts'],p['contract_size']))
     e.put(c,'entry_bar_'+pair+'_'+strategy,evidence['bar'])
     return None
@@ -191,7 +192,7 @@ def mark_positions(e,quotes,now):
                 continue
             peak=max(p['peak'],ex) if sign==1 else min(p['peak'],ex)
             stop=p['stop']
-            if p['strategy']=='SNIPER_SCALP':
+            if p['strategy'] in ('SNIPER_SCALP','ORB'):
                 try:
                     fill=e.execution_price(q,'SELL' if sign==1 else 'BUY',qty=p['qty'])
                     net=sign*(fill-p['entry'])*p['qty']-p['entry_fee']-fee(p['contracts'],p['contract_size'],fill)
