@@ -51,7 +51,7 @@ def test_high_fee_small_target_is_rejected_without_changing_assumptions(directio
     with e.db() as c: ev=e.scalp_evidence(c,"BTC-USD",now)
     plan,error=e.scalp_trade_plan(q,ev)
     assert error and plan["net_rr"]<2
-    assert plan["round_trip_fee_pct"]==pytest.approx(1.2)
+    assert plan["round_trip_fee_pct"]==pytest.approx(1.8)
     neutral_news(now)
     assert e.decide("BTC-USD",q,now,"SNIPER_SCALP")["status"]=="WAIT"
     assert not e.dashboard()["trades"]

@@ -24,12 +24,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chief")
-VERSION = "2.1.0-paper"
+VERSION = "2.2.0-paper"
 PAIRS = ("BTC-USD", "ETH-USD", "SOL-USD")
 DB_PATH = os.getenv("DB_PATH", "/data/chief.sqlite")
 START_CASH = float(os.getenv("PAPER_STARTING_CASH", "500"))
-FEE = float(os.getenv("PAPER_FEE_RATE", "0.006"))
-SLIPPAGE = float(os.getenv("PAPER_SLIPPAGE", "0.001"))
+FEE = float(os.getenv("PAPER_FEE_RATE", "0.009"))
+# Optional additional stress buffer on top of measured book impact, not Coinbase's slippage fee.
+SLIPPAGE = float(os.getenv("PAPER_SLIPPAGE", "0"))
+FEE_SOURCE = "Connected Coinbase SPOT Intro snapshot verified 2026-11-06 America/Chicago"
 LEVERAGE = min(3., max(1., float(os.getenv("PAPER_LEVERAGE", "2"))))
 POLL = max(60, int(os.getenv("POLL_SECONDS", "300")))
 MARK_POLL = 5
@@ -171,14 +173,50 @@ def store_bars(c, pair, interval, bars):
 
 
 async def fetch_quote(client, pair):
-    r = await client.get("https://api.exchange.coinbase.com/products/" + pair + "/ticker")
+    r = await client.get("https://api.coinbase.com/api/v3/brokerage/market/product_book", params={"product_id": pair, "limit": 50}, headers={"Cache-Control": "no-cache"})
     r.raise_for_status()
-    d = r.json()
-    price, bid, ask = [float(d[k]) for k in ("price", "bid", "ask")]
-    ts = datetime.fromisoformat(d["time"].replace("Z", "+00:00")).timestamp()
-    if not all(math.isfinite(x) and x > 0 for x in (price, bid, ask)) or bid > ask or not -5 <= time.time() - ts <= 45:
-        raise ValueError("Stale or invalid Coinbase quote")
-    return {"price": price, "bid": bid, "ask": ask, "ts": int(ts)}
+    return normalize_book(r.json(), pair, time.time())
+
+
+def normalize_book(data, pair, now):
+    book = data.get("pricebook", {})
+    if book.get("product_id") != pair: raise ValueError("Order book product mismatch")
+    ts = datetime.fromisoformat(book["time"].replace("Z", "+00:00")).timestamp()
+    if not -5 <= now - ts <= 10: raise ValueError("Stale Coinbase order book")
+    sides = {}
+    for side in ("bids", "asks"):
+        rows = book.get(side)
+        if not isinstance(rows, list) or not rows: raise ValueError("Empty order book side")
+        values = [(float(r["price"]), float(r["size"])) for r in rows[:50]]
+        if any(not math.isfinite(x) or x <= 0 for row in values for x in row): raise ValueError("Invalid order book level")
+        sides[side] = sorted(values, reverse=side == "bids")
+    bid, ask = sides["bids"][0][0], sides["asks"][0][0]
+    if bid > ask: raise ValueError("Crossed order book")
+    return {"price": (bid + ask) / 2, "bid": bid, "ask": ask, "ts": int(ts), **sides, "source": "Coinbase public product book"}
+
+
+def book_vwap(quote, side, qty=None, notional=None):
+    if side not in ("BUY", "SELL") or (qty is None) == (notional is None): raise ValueError("Invalid book execution request")
+    remaining = float(qty if qty is not None else notional)
+    if not math.isfinite(remaining) or remaining <= 0: raise ValueError("Invalid paper order size")
+    total_qty, value = 0., 0.
+    levels = quote.get("asks" if side == "BUY" else "bids", [])
+    for price, size in levels:
+        take = min(size, remaining if qty is not None else remaining / price)
+        total_qty += take; value += take * price
+        remaining -= take if qty is not None else take * price
+        if remaining <= 1e-9: return value / total_qty
+    raise ValueError("Insufficient visible Coinbase book depth for the complete paper fill")
+
+
+def execution_price(quote, side, qty=None, notional=None):
+    return book_vwap(quote, side, qty, notional) * (1 + SLIPPAGE if side == "BUY" else 1 - SLIPPAGE)
+
+
+def impact_rate(quote, side, qty=None, notional=None):
+    vwap = book_vwap(quote, side, qty, notional)
+    top = quote["ask"] if side == "BUY" else quote["bid"]
+    return max(0., vwap / top - 1 if side == "BUY" else 1 - vwap / top)
 
 
 def classify_headline(title):
@@ -414,7 +452,11 @@ def scalp_trade_plan(quote, evidence):
     if direction not in ("LONG", "SHORT") or not evidence.get("structural_stop"):
         return None, "Sniper: no confirmed structural invalidation"
     sign = direction_sign(direction)
-    entry = (quote["ask"] if sign == 1 else quote["bid"]) * (1 + sign * SLIPPAGE)
+    probe = quote.get("plan_notional", 250.)
+    try:
+        entry = execution_price(quote, "BUY" if sign == 1 else "SELL", notional=probe)
+        exit_impact = impact_rate(quote, "SELL" if sign == 1 else "BUY", qty=probe / entry)
+    except ValueError as exc: return None, "Sniper: " + str(exc)
     stop = evidence["structural_stop"]
     distance = sign * (entry - stop) / entry
     if not .001 <= distance <= .008:
@@ -426,12 +468,13 @@ def scalp_trade_plan(quote, evidence):
     if move <= 0: return None, "Sniper: no clear room to the opposite range level"
     target = entry + sign * move
     holding = HOLDING_RATE * SCALP_MAX_HOLD / 28800
-    stop_ratio = stop * (1 - sign * SLIPPAGE) / entry
-    target_ratio = target * (1 - sign * SLIPPAGE) / entry
+    projected_exit_factor = (1 - sign * exit_impact) * (1 - sign * SLIPPAGE)
+    stop_ratio = stop * projected_exit_factor / entry
+    target_ratio = target * projected_exit_factor / entry
     loss = -(sign * (stop_ratio - 1) - FEE * (1 + stop_ratio) - holding)
     reward = sign * (target_ratio - 1) - FEE * (1 + target_ratio) - holding
     rr = reward / loss if loss > 0 else 0
-    plan = {"strategy": "SNIPER_SCALP", "entry_estimate": entry, "stop": stop, "target": target, "risk_fraction": loss, "risk_rate": SCALP_RISK, "reward_fraction": reward, "net_rr": rr, "max_hold_seconds": SCALP_MAX_HOLD, "round_trip_fee_pct": FEE * 200, "round_trip_slippage_pct": SLIPPAGE * 200, "spread_pct": (quote["ask"] - quote["bid"]) / quote["price"] * 100}
+    plan = {"strategy": "SNIPER_SCALP", "entry_estimate": entry, "stop": stop, "target": target, "risk_fraction": loss, "risk_rate": SCALP_RISK, "reward_fraction": reward, "net_rr": rr, "max_hold_seconds": SCALP_MAX_HOLD, "round_trip_fee_pct": FEE * 200, "additional_stress_per_side_pct": SLIPPAGE * 100, "projected_exit_book_impact_pct": exit_impact * 100, "cost_probe_notional": probe, "book_time": iso(quote["ts"]), "fee_source": FEE_SOURCE, "spread_pct": (quote["ask"] - quote["bid"]) / quote["price"] * 100}
     if reward <= 0 or rr < 2:
         return plan, f"Sniper: net reward/risk {rr:.2f}R is below 2R after modeled fees/spread/slippage; wait"
     return plan, None
@@ -439,21 +482,26 @@ def scalp_trade_plan(quote, evidence):
 
 def open_position(c, pair, direction, quote, evidence, now):
     sign = direction_sign(direction)
-    execution = (quote["ask"] if sign == 1 else quote["bid"]) * (1 + sign * SLIPPAGE)
     eq, cash = equity_value(c), float(get(c, "cash"))
     exposure = sum(p["qty"] * p["mark"] for p in c.execute("SELECT * FROM positions"))
     strategy = evidence.get("strategy", "BREAKOUT")
     plan = evidence.get("plan") if strategy == "SNIPER_SCALP" else None
     if strategy == "SNIPER_SCALP" and (not plan or plan["net_rr"] < 2): return "Sniper plan must pass costs and minimum 2R net reward/risk"
     # Breakout retains its original sizing. Sniper uses its tighter structural stop and net costs.
-    risk_per_dollar = plan["risk_fraction"] if plan else STOP + FEE * (2 + STOP) + 2 * SLIPPAGE + 3 * HOLDING_RATE
+    try:
+        depth_stress = max(impact_rate(quote, "BUY", notional=max(10., eq * .5)), impact_rate(quote, "SELL", notional=max(10., eq * .5)))
+    except ValueError as exc: return str(exc)
+    risk_per_dollar = plan["risk_fraction"] if plan else STOP + FEE * (2 + STOP) + 2 * (SLIPPAGE + depth_stress) + 3 * HOLDING_RATE
     risk_rate = SCALP_RISK if plan else RISK
     notional = min(eq * risk_rate / risk_per_dollar, eq * .5, max(0, eq * 2 - exposure), cash / (1 / LEVERAGE + FEE))
     if notional < 10: return "Insufficient free margin or exposure allowance"
+    try: execution = execution_price(quote, "BUY" if sign == 1 else "SELL", notional=notional)
+    except ValueError as exc: return str(exc)
     margin, qty, fee = notional / LEVERAGE, notional / execution, notional * FEE
     stop, target = (plan["stop"], plan["target"]) if plan else (execution * (1 - sign * STOP), execution * (1 + sign * STOP * 2))
     risk_amount = notional * risk_per_dollar
     evidence["strategy"], evidence["planned_risk_amount"] = strategy, risk_amount
+    evidence["execution"] = {"model": "COINBASE_BOOK_VWAP", "book_time": iso(quote["ts"]), "fee_rate": FEE, "fee_source": FEE_SOURCE, "additional_stress_rate": SLIPPAGE, "book_impact_rate": impact_rate(quote, "BUY" if sign == 1 else "SELL", qty=qty)}
     payload = json.dumps(evidence, separators=(",", ":"))
     put(c, "cash", cash - margin - fee)
     c.execute("INSERT INTO positions(pair,qty,entry,entry_fee,stop,peak,opened,direction,leverage,margin,target,initial_stop,funding,funding_at,evidence,mark,mark_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (pair, qty, execution, fee, stop, execution, now, direction, LEVERAGE, margin, target, stop, 0, now, payload, quote["price"], quote["ts"]))
@@ -467,11 +515,15 @@ def open_position(c, pair, direction, quote, evidence, now):
 
 def close_position(c, p, quote, reason, now):
     sign = direction_sign(p["direction"])
-    execution = (quote["bid"] if sign == 1 else quote["ask"]) * (1 - sign * SLIPPAGE)
+    side = "SELL" if sign == 1 else "BUY"
+    execution = execution_price(quote, side, qty=p["qty"])
     exit_fee = p["qty"] * execution * FEE
     gross_pnl = sign * (execution - p["entry"]) * p["qty"]
     credit = max(0., p["margin"] + gross_pnl - exit_fee - p["funding"])
     pnl = credit - p["margin"] - p["entry_fee"]
+    exit_evidence = json.loads(p["evidence"])
+    exit_evidence["exit_execution"] = {"model": "COINBASE_BOOK_VWAP", "book_time": iso(quote["ts"]), "fee_rate": FEE, "fee_source": FEE_SOURCE, "additional_stress_rate": SLIPPAGE, "book_impact_rate": impact_rate(quote, side, qty=p["qty"])}
+    p = {**p, "evidence": json.dumps(exit_evidence)}
     put(c, "cash", float(get(c, "cash")) + credit)
     c.execute("DELETE FROM positions WHERE pair=?", (p["pair"],))
     c.execute("INSERT INTO trades(ts,pair,side,qty,price,fee,reason,pnl,direction,action,leverage,margin,funding,evidence,strategy,hold_seconds,risk_amount,r_multiple) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (now, p["pair"], "SELL" if sign == 1 else "BUY", p["qty"], execution, exit_fee, reason, pnl, p["direction"], "CLOSE_" + p["direction"], p["leverage"], p["margin"], p["funding"], p["evidence"], p["strategy"], max(0, now - p["opened"]), p["risk_amount"], pnl / p["risk_amount"] if p["risk_amount"] > 0 else None))
@@ -497,17 +549,26 @@ def mark_positions(quotes, now):
             reason = "liquidation" if isolated_equity <= p["qty"] * exit_mark * MAINTENANCE else "stop" if sign * (exit_mark - p["stop"]) <= 0 else "target" if p["target"] and sign * (exit_mark - p["target"]) >= 0 else None
             if not reason and p["expires"] and now >= p["expires"]: reason = "time_stop"
             if reason:
-                close_position(c, p, quote, reason, now)
+                try: close_position(c, p, quote, reason, now)
+                except ValueError:
+                    c.execute("UPDATE positions SET funding=?,funding_at=?,mark=?,mark_ts=? WHERE pair=?", (p["funding"], now, p["mark"], p["mark_ts"], p["pair"]))
+                    log.warning("Protective exit waiting for sufficient visible book depth: %s", p["pair"])
             else:
                 p["peak"] = max(p["peak"], exit_mark) if sign == 1 else min(p["peak"], exit_mark)
                 if p["strategy"] == "SNIPER_SCALP":
                     notional = p["qty"] * p["entry"]
-                    ratio = exit_mark * (1 - sign * SLIPPAGE) / p["entry"]
-                    net_fraction = sign * (ratio - 1) - FEE * (1 + ratio) - p["funding"] / notional
+                    try:
+                        exit_impact = impact_rate(quote, "SELL" if sign == 1 else "BUY", qty=p["qty"])
+                        exit_factor = (1 - sign * exit_impact) * (1 - sign * SLIPPAGE)
+                        ratio = exit_mark * exit_factor / p["entry"]
+                    except ValueError:
+                        exit_factor, ratio = None, 0 if sign == 1 else float("inf")
+                    entry_cost = p["entry_fee"] / notional
+                    net_fraction = sign * (ratio - 1) - entry_cost - FEE * ratio - p["funding"] / notional
                     if net_fraction >= p["risk_amount"] / notional:
                         cost = p["funding"] / notional
-                        be_ratio = (1 + FEE + cost) / (1 - FEE) if sign == 1 else (1 - FEE - cost) / (1 + FEE)
-                        breakeven = p["entry"] * be_ratio / (1 - sign * SLIPPAGE)
+                        be_ratio = (1 + entry_cost + cost) / (1 - FEE) if sign == 1 else (1 - entry_cost - cost) / (1 + FEE)
+                        breakeven = p["entry"] * be_ratio / exit_factor
                         p["stop"] = max(p["stop"], breakeven) if sign == 1 else min(p["stop"], breakeven)
                 elif sign * (p["peak"] / p["entry"] - 1) >= STOP:
                     trail = p["peak"] * (1 - sign * .02)
@@ -539,6 +600,7 @@ def decide(pair, quote, now, strategy="BREAKOUT"):
         elif (quote["ask"] - quote["bid"]) / quote["price"] > .003: reasons.append("Bid/ask spread exceeds 0.3%; entry blocked")
         elif direction and abs(quote["price"] / ev.get("one_minute_close" if strategy == "SNIPER_SCALP" else "five_minute_close", quote["price"]) - 1) > (.0015 if strategy == "SNIPER_SCALP" else .01): reasons.append("Price moved beyond confirmation tolerance; do not chase")
         if strategy == "SNIPER_SCALP" and quote and -5 <= now - quote["ts"] <= 45 and ev.get("structural_stop"):
+            quote = {**quote, "plan_notional": max(10., min(equity_value(c) * .5, float(get(c, "cash")) / (1 / LEVERAGE + FEE)))}
             plan, plan_error = scalp_trade_plan(quote, ev)
             ev["plan"] = plan
             if plan_error: reasons.append(plan_error)
@@ -658,7 +720,7 @@ def health():
         try: ok = time.time() - datetime.fromisoformat(success).timestamp() < max(900, POLL * 3) and not err
         except (ValueError, TypeError): ok = False
         n = news_context(c, PAIRS[0], int(time.time()))
-    return JSONResponse({"status": "ok" if ok else "degraded", "version": VERSION, "mode": "PAPER_ONLY", "live_trading": False, "last_scan": scan, "error": err, "capabilities": ["LONG", "SHORT", "SIMULATED_ISOLATED_MARGIN", "NEWS_GATES", "DURABLE_JOURNAL", "SNIPER_SCALP"], "strategies": STRATEGIES, "leverage": LEVERAGE, "news_ready": n["available"]}, status_code=200 if ok else 503)
+    return JSONResponse({"status": "ok" if ok else "degraded", "version": VERSION, "mode": "PAPER_ONLY", "live_trading": False, "last_scan": scan, "error": err, "capabilities": ["LONG", "SHORT", "SIMULATED_ISOLATED_MARGIN", "NEWS_GATES", "DURABLE_JOURNAL", "SNIPER_SCALP"], "strategies": STRATEGIES, "leverage": LEVERAGE, "news_ready": n["available"], "fee_rate": FEE, "slippage_model": "COINBASE_BOOK_VWAP", "additional_stress_rate": SLIPPAGE}, status_code=200 if ok else 503)
 
 
 def parsed_decision(row):
@@ -687,7 +749,7 @@ def dashboard():
             stats["win_rate"] = stats["wins"] / stats["completed"] * 100 if stats["completed"] else None
             strategy_results.append(stats)
         curve = [dict(e) for e in c.execute("SELECT * FROM equity ORDER BY ts DESC LIMIT 200")][::-1]
-        return {"version": VERSION, "mode": "PAPER_ONLY", "markets": PAIRS, "cash": round(float(get(c, "cash")), 6), "equity": round(equity_value(c), 6), "positions": positions, "trades": trades, "equity_history": curve, "last_scan": get(c, "last_scan"), "last_success": get(c, "last_success"), "last_mark": get(c, "last_mark"), "last_error": get(c, "last_error"), "entries_paused": bool(risk_blocks(c, now)), "pause_reasons": risk_blocks(c, now), "emergency_paused": get(c, "emergency_paused") == "true", "controls_supported": True, "fee_rate": FEE, "slippage_rate": SLIPPAGE, "journal": {"day": get(c, "day"), **dict(j), "limit": 5, "reserved": len(positions)}, "totals": totals, "strategy_results": strategy_results, "decisions": decisions, "news": {p: news_context(c, p, now) for p in PAIRS}, "settings": {"leverage": LEVERAGE, "max_leverage": 3, "risk_per_trade_pct": RISK * 100, "daily_loss_pct": DAILY_LOSS * 100, "stop_pct": STOP * 100, "target_r": 2, "mark_poll_seconds": MARK_POLL, "holding_cost_per_8h": HOLDING_RATE, "maintenance_margin_rate": MAINTENANCE, "max_positions": 2, "scalp_risk_pct": SCALP_RISK * 100, "scalp_max_hold_seconds": SCALP_MAX_HOLD, "scalp_min_net_rr": 2, "scalp_scan_seconds": 60}, "disclosure": "Synthetic isolated-margin simulation on Coinbase SPOT prices, not a Coinbase derivatives account. Bid/ask + assumed slippage/fees. Assumed holding cost on both sides, not actual funding. Stops/targets sampled about every 5s; fast crossings can be missed and outages delay exits. Liquidation is an assumed model, not exchange rules. Sniper is a fixed-rule paper strategy, not a trained predictive model. No historical news backtest or profitability claim."}
+        return {"version": VERSION, "mode": "PAPER_ONLY", "markets": PAIRS, "cash": round(float(get(c, "cash")), 6), "equity": round(equity_value(c), 6), "positions": positions, "trades": trades, "equity_history": curve, "last_scan": get(c, "last_scan"), "last_success": get(c, "last_success"), "last_mark": get(c, "last_mark"), "last_error": get(c, "last_error"), "entries_paused": bool(risk_blocks(c, now)), "pause_reasons": risk_blocks(c, now), "emergency_paused": get(c, "emergency_paused") == "true", "controls_supported": True, "fee_rate": FEE, "slippage_rate": SLIPPAGE, "slippage_model": "COINBASE_BOOK_VWAP", "fee_profile": {"market": "SPOT_PRICE_PROXY", "tier": "Intro", "order_type": "TAKER", "maker_rate": .005, "taker_rate": FEE, "source": FEE_SOURCE, "futures_reference": {"maker_rate": .00095, "taker_rate": .001, "additional_contract_charges": True, "applied": False}}, "journal": {"day": get(c, "day"), **dict(j), "limit": 5, "reserved": len(positions)}, "totals": totals, "strategy_results": strategy_results, "decisions": decisions, "news": {p: news_context(c, p, now) for p in PAIRS}, "settings": {"leverage": LEVERAGE, "max_leverage": 3, "risk_per_trade_pct": RISK * 100, "daily_loss_pct": DAILY_LOSS * 100, "stop_pct": STOP * 100, "target_r": 2, "mark_poll_seconds": MARK_POLL, "holding_cost_per_8h": HOLDING_RATE, "maintenance_margin_rate": MAINTENANCE, "max_positions": 2, "scalp_risk_pct": SCALP_RISK * 100, "scalp_max_hold_seconds": SCALP_MAX_HOLD, "scalp_min_net_rr": 2, "scalp_scan_seconds": 60}, "disclosure": "Synthetic isolated-margin simulation on Coinbase SPOT prices, not a Coinbase derivatives account. Entry/exit fills use size-weighted Coinbase spot book depth and the verified-account taker-fee snapshot. Optional additional stress is separate. Snapshot depth is not a guaranteed future fill; unseen market changes can add slippage. Assumed holding cost on both sides, not actual funding. Stops/targets sampled about every 5s; fast crossings can be missed and outages delay exits. Liquidation is an assumed model, not exchange rules. Sniper is a fixed-rule paper strategy, not a trained predictive model. No historical news backtest or profitability claim."}
 
 
 @app.get("/api/journal")

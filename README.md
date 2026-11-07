@@ -1,4 +1,4 @@
-# Chief Paper Gym v2.1 · Sniper Scalp + Breakout
+# Chief Paper Gym v2.2 · Sniper Scalp + Breakout
 
 Paper-only BTC / ETH / SOL long/short simulator. It has no exchange credentials,
 private exchange APIs, live mode, transfers, or manual order endpoint.
@@ -11,7 +11,11 @@ private exchange APIs, live mode, transfers, or manual order endpoint.
 - Maximum two positions, gross notional <=2x equity, and five daily entries/completions with reservations for open positions. This is a ceiling, not a target.
 - A 2% daily equity drawdown latches an entry halt until the next UTC day. Pause/resume never bypasses that halt.
 - 3% initial stop, 2R target, trailing stop after a 1R advance. Exits use executable bid/ask snapshots about every 5 seconds, including while strategy/news data refreshes. Brief crossings can be missed; network failures delay exits.
-- Fees and slippage use existing `PAPER_FEE_RATE` and `PAPER_SLIPPAGE`. Holding cost is an explicit 0.01% assumed cost per 8 hours, prorated on both sides, **not exchange funding**.
+- Connected Coinbase SPOT Intro fee snapshot verified November 6, 2026 (America/Chicago): maker 0.50%, taker 0.90% per side. Paper market fills use taker (`PAPER_FEE_RATE=0.009`). Snapshot must be rechecked when tiers change. Prior fills keep their original fees; exit fees use the current model.
+- Execution walks fresh Coinbase public spot-book bids/asks (up to 50 levels per side), weighted by proposed size. Spread and depth impact are included once. Insufficient visible depth prevents a fabricated full fill; protective exits retry while continuing marks and holding costs. Future fills can differ from snapshot estimates.
+- `PAPER_SLIPPAGE` is now optional additional stress ON TOP of book impact; default 0, not a claim of zero slippage. Holding cost remains an explicit 0.01% assumed cost per 8 hours, prorated on both sides, **not exchange funding**.
+- Connected U.S. CFM futures reference: maker 0.095%, taker 0.10% per side plus additional contract charges. These rates are NOT applied to spot-price synthetic margin. Contract-specific execution, fees and margin would require a separate futures model.
+- Sources: https://www.coinbase.com/advanced-vip ; https://help.coinbase.com/en/coinbase/trading-and-funding/advanced-trade/slippage ; https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product-book
 - Modeled maintenance margin is 5% of marked notional. Gap losses are capped at the position's isolated margin plus the entry fee. The liquidation model is illustrative, not exchange-specific.
 
 ## Entry evidence

@@ -23,7 +23,7 @@ def account(tmp_path, monkeypatch):
 
 
 def quote(price=100, now=None):
-    return {"price": price, "bid": price, "ask": price, "ts": int(now or time.time())}
+    return {"price": price, "bid": price, "ask": price, "ts": int(now or time.time()), "bids": [(price, 10000.)], "asks": [(price, 10000.)]}
 
 
 def open_one(direction="LONG", pair="BTC-USD", now=None):
