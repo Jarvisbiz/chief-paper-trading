@@ -97,3 +97,27 @@ This configures a fixed-rule forward-test strategy; it does not train a predicti
 model, establish a profitable edge, or complete historical news-aware backtesting.
 Offline tests include a deliberately lower-fee fixture to exercise successful scalp
 accounting. Those fixture fees and trades NEVER replace production settings/history.
+
+## Small-account U.S. futures readiness (v2.3)
+
+Rene selected Coinbase U.S. futures and an $80–$150 live-capital range. The
+production small-account run uses `PAPER_STARTING_CASH=80`,
+`DB_PATH=/data/chief-practice-80.sqlite` and
+`PAPER_PRACTICE_VENUE=COINBASE_US_FUTURES`. The previous `/data/chief.sqlite`
+remains on the mounted volume intact; this is a new run, not a history rewrite.
+Restarts preserve the new balance and never top it up automatically.
+
+The authenticated budget report compares $80/$100/$150 using fresh public dated
+nano-contract metadata and mid-book snapshots, whole minimum contracts, higher
+of intraday/overnight margin by direction, and the connected FUTURE Intro taker
+snapshot (0.10% plus published $0.15/contract per side). Estimates include both
+fees; example price stop is 0.3%, risk 0.25%. These are affordability floors,
+excluding spread/depth, liquidation charges and settlement details. Missing,
+closed or stale (>600s) contract data never claims readiness. No rollover trades,
+fractional contracts or margin offsets are invented.
+
+Full U.S. futures fills, clearing, variation margin and settlement are not
+implemented. For this selected venue, entries are explicitly blocked, including
+direct calls to open_position: no spot-price proxy results are published as
+futures performance. Strategy/news scans still record WAIT and the budget reason.
+Legacy SPOT_PRICE_PROXY mode remains available for the preserved earlier run.

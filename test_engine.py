@@ -16,6 +16,7 @@ import main as e
 def account(tmp_path, monkeypatch):
     monkeypatch.setattr(e, "DB_PATH", str(tmp_path / "paper.sqlite"))
     monkeypatch.setattr(e, "PAUSED", False)
+    monkeypatch.setattr(e, "START_CASH", 500.)
     monkeypatch.setattr(e, "LEVERAGE", 2.)
     monkeypatch.setenv("DASHBOARD_USER", "fixture")
     monkeypatch.setenv("DASHBOARD_PASSWORD", "fixture-password")

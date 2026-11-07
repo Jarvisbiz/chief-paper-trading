@@ -21,13 +21,16 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+import practice_budget as practice
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chief")
-VERSION = "2.2.0-paper"
+VERSION = "2.3.0-paper"
 PAIRS = ("BTC-USD", "ETH-USD", "SOL-USD")
 DB_PATH = os.getenv("DB_PATH", "/data/chief.sqlite")
-START_CASH = float(os.getenv("PAPER_STARTING_CASH", "500"))
+START_CASH = float(os.getenv("PAPER_STARTING_CASH", "80"))
+PRACTICE_VENUE = os.getenv("PAPER_PRACTICE_VENUE", "SPOT_PRICE_PROXY")
+if not math.isfinite(START_CASH) or START_CASH <= 0: raise ValueError("Invalid practice starting cash")
 FEE = float(os.getenv("PAPER_FEE_RATE", "0.009"))
 # Optional additional stress buffer on top of measured book impact, not Coinbase's slippage fee.
 SLIPPAGE = float(os.getenv("PAPER_SLIPPAGE", "0"))
@@ -97,7 +100,7 @@ def init():
         c.execute("CREATE TABLE IF NOT EXISTS decisions(pair TEXT,bar INTEGER,ts INTEGER,status TEXT,direction TEXT,reasons TEXT,evidence TEXT,PRIMARY KEY(pair,bar))")
         c.execute("CREATE TABLE IF NOT EXISTS strategy_decisions(pair TEXT,strategy TEXT,bar INTEGER,ts INTEGER,status TEXT,direction TEXT,reasons TEXT,evidence TEXT,PRIMARY KEY(pair,strategy,bar))")
         c.execute("INSERT OR IGNORE INTO strategy_decisions SELECT pair,'BREAKOUT',bar,ts,status,direction,reasons,evidence FROM decisions")
-        for k, v in (("cash", START_CASH), ("day", ""), ("day_start", START_CASH), ("last_scan", "never"), ("last_success", "never"), ("last_error", ""), ("last_mark", "never")):
+        for k, v in (("cash", START_CASH), ("starting_cash", START_CASH), ("day", ""), ("day_start", START_CASH), ("last_scan", "never"), ("last_success", "never"), ("last_error", ""), ("last_mark", "never")):
             c.execute("INSERT OR IGNORE INTO state VALUES (?,?)", (k, str(v)))
         put(c, "version", VERSION)
 
@@ -481,6 +484,8 @@ def scalp_trade_plan(quote, evidence):
 
 
 def open_position(c, pair, direction, quote, evidence, now):
+    if PRACTICE_VENUE == "COINBASE_US_FUTURES":
+        return "U.S. futures fill/settlement adapter not implemented; no spot-proxy substitute allowed"
     sign = direction_sign(direction)
     eq, cash = equity_value(c), float(get(c, "cash"))
     exposure = sum(p["qty"] * p["mark"] for p in c.execute("SELECT * FROM positions"))
@@ -588,6 +593,12 @@ def decide(pair, quote, now, strategy="BREAKOUT"):
         news = news_context(c, pair, now)
         ev["news"] = news
         reasons = list(ev["reasons"]) + risk_blocks(c, now)
+        if PRACTICE_VENUE == "COINBASE_US_FUTURES":
+            snapshots = json.loads(get(c, "futures_snapshots") or "{}")
+            budget = practice.assess(snapshots.get(pair), max(.01, equity_value(c)), ev.get("direction") or "LONG", stop_fraction=.001 if strategy == "SNIPER_SCALP" else STOP, risk_rate=SCALP_RISK if strategy == "SNIPER_SCALP" else RISK, now=now)
+            ev["minimum_contract_budget"] = budget
+            reasons += ([budget["reason"]] if not budget["available"] else [f"U.S. futures: {reason}; minimum planned loss floor ${budget['planned_loss_floor']:.2f}, allowed ${budget['allowed_loss']:.2f}" for reason in budget["reasons"]])
+            reasons.append("U.S. futures practice: fill/settlement adapter incomplete; spot-proxy entries disabled")
         direction = ev["direction"]
         bar = ev.get("bar", int(now // 300) * 300 - 300)
         ev["bar"] = bar
@@ -617,6 +628,31 @@ def decide(pair, quote, now, strategy="BREAKOUT"):
         return {"status": status, "reasons": reasons}
 
 
+async def refresh_futures_budget(client):
+    try:
+        r = await client.get("https://api.coinbase.com/api/v3/brokerage/market/products", params={"product_type": "FUTURE", "limit": 250}, headers={"Cache-Control": "no-cache"})
+        r.raise_for_status()
+        products, snapshots, now = r.json().get("products", []), {}, time.time()
+        for pair, root in practice.ROOTS.items():
+            candidates = []
+            for p in products:
+                if not p.get("product_id", "").startswith(root + "-"): continue
+                try:
+                    snap = practice.contract_snapshot(p, now)
+                    candidates.append((snap["expiry"], p))
+                except (KeyError, TypeError, ValueError): continue
+            if not candidates: continue
+            p = min(candidates, key=lambda item: item[0])[1]
+            try:
+                r = await client.get("https://api.coinbase.com/api/v3/brokerage/market/product_book", params={"product_id": p["product_id"], "limit": 50}, headers={"Cache-Control": "no-cache"})
+                r.raise_for_status()
+                q = normalize_book(r.json(), p["product_id"], time.time())
+                snapshots[pair] = practice.contract_snapshot({**p, "price": q["price"]}, q["ts"])
+            except (httpx.HTTPError, KeyError, TypeError, ValueError): log.warning("Futures budget quote unavailable: %s", pair)
+        with db() as c: put(c, "futures_snapshots", json.dumps(snapshots))
+    except Exception: log.warning("Futures budget specifications unavailable; stale scenarios will be marked unavailable")
+
+
 async def scanner():
     await asyncio.sleep(2)
     async with httpx.AsyncClient(headers={"User-Agent": "ChiefPaperResearch/2.1"}, timeout=15, follow_redirects=False) as client:
@@ -628,7 +664,9 @@ async def scanner():
                 continue
             slow_due = now >= next_slow
             errors = []
-            if slow_due: await refresh_news(client)
+            if slow_due:
+                await refresh_news(client)
+                if PRACTICE_VENUE == "COINBASE_US_FUTURES": await refresh_futures_budget(client)
             for pair in PAIRS:
                 try:
                     if slow_due:
@@ -720,7 +758,7 @@ def health():
         try: ok = time.time() - datetime.fromisoformat(success).timestamp() < max(900, POLL * 3) and not err
         except (ValueError, TypeError): ok = False
         n = news_context(c, PAIRS[0], int(time.time()))
-    return JSONResponse({"status": "ok" if ok else "degraded", "version": VERSION, "mode": "PAPER_ONLY", "live_trading": False, "last_scan": scan, "error": err, "capabilities": ["LONG", "SHORT", "SIMULATED_ISOLATED_MARGIN", "NEWS_GATES", "DURABLE_JOURNAL", "SNIPER_SCALP"], "strategies": STRATEGIES, "leverage": LEVERAGE, "news_ready": n["available"], "fee_rate": FEE, "slippage_model": "COINBASE_BOOK_VWAP", "additional_stress_rate": SLIPPAGE}, status_code=200 if ok else 503)
+    return JSONResponse({"status": "ok" if ok else "degraded", "version": VERSION, "mode": "PAPER_ONLY", "live_trading": False, "practice_venue": PRACTICE_VENUE, "practice_starting_cash": START_CASH, "futures_execution_ready": False, "last_scan": scan, "error": err, "capabilities": ["LONG", "SHORT", "SIMULATED_ISOLATED_MARGIN", "NEWS_GATES", "DURABLE_JOURNAL", "SNIPER_SCALP"], "strategies": STRATEGIES, "leverage": LEVERAGE, "news_ready": n["available"], "fee_rate": FEE, "slippage_model": "COINBASE_BOOK_VWAP", "additional_stress_rate": SLIPPAGE}, status_code=200 if ok else 503)
 
 
 def parsed_decision(row):
@@ -749,7 +787,7 @@ def dashboard():
             stats["win_rate"] = stats["wins"] / stats["completed"] * 100 if stats["completed"] else None
             strategy_results.append(stats)
         curve = [dict(e) for e in c.execute("SELECT * FROM equity ORDER BY ts DESC LIMIT 200")][::-1]
-        return {"version": VERSION, "mode": "PAPER_ONLY", "markets": PAIRS, "cash": round(float(get(c, "cash")), 6), "equity": round(equity_value(c), 6), "positions": positions, "trades": trades, "equity_history": curve, "last_scan": get(c, "last_scan"), "last_success": get(c, "last_success"), "last_mark": get(c, "last_mark"), "last_error": get(c, "last_error"), "entries_paused": bool(risk_blocks(c, now)), "pause_reasons": risk_blocks(c, now), "emergency_paused": get(c, "emergency_paused") == "true", "controls_supported": True, "fee_rate": FEE, "slippage_rate": SLIPPAGE, "slippage_model": "COINBASE_BOOK_VWAP", "fee_profile": {"market": "SPOT_PRICE_PROXY", "tier": "Intro", "order_type": "TAKER", "maker_rate": .005, "taker_rate": FEE, "source": FEE_SOURCE, "futures_reference": {"maker_rate": .00095, "taker_rate": .001, "additional_contract_charges": True, "applied": False}}, "journal": {"day": get(c, "day"), **dict(j), "limit": 5, "reserved": len(positions)}, "totals": totals, "strategy_results": strategy_results, "decisions": decisions, "news": {p: news_context(c, p, now) for p in PAIRS}, "settings": {"leverage": LEVERAGE, "max_leverage": 3, "risk_per_trade_pct": RISK * 100, "daily_loss_pct": DAILY_LOSS * 100, "stop_pct": STOP * 100, "target_r": 2, "mark_poll_seconds": MARK_POLL, "holding_cost_per_8h": HOLDING_RATE, "maintenance_margin_rate": MAINTENANCE, "max_positions": 2, "scalp_risk_pct": SCALP_RISK * 100, "scalp_max_hold_seconds": SCALP_MAX_HOLD, "scalp_min_net_rr": 2, "scalp_scan_seconds": 60}, "disclosure": "Synthetic isolated-margin simulation on Coinbase SPOT prices, not a Coinbase derivatives account. Entry/exit fills use size-weighted Coinbase spot book depth and the verified-account taker-fee snapshot. Optional additional stress is separate. Snapshot depth is not a guaranteed future fill; unseen market changes can add slippage. Assumed holding cost on both sides, not actual funding. Stops/targets sampled about every 5s; fast crossings can be missed and outages delay exits. Liquidation is an assumed model, not exchange rules. Sniper is a fixed-rule paper strategy, not a trained predictive model. No historical news backtest or profitability claim."}
+        return {"version": VERSION, "mode": "PAPER_ONLY", "account_profile": {"starting_cash": float(get(c, "starting_cash") or START_CASH), "target_balance_range": [80, 150], "practice_venue": PRACTICE_VENUE, "legacy_history_preserved": PRACTICE_VENUE == "COINBASE_US_FUTURES"}, "futures_budget": practice.report(json.loads(get(c, "futures_snapshots") or "{}"), max(.01, equity_value(c)), now) if PRACTICE_VENUE == "COINBASE_US_FUTURES" else None, "markets": PAIRS, "cash": round(float(get(c, "cash")), 6), "equity": round(equity_value(c), 6), "positions": positions, "trades": trades, "equity_history": curve, "last_scan": get(c, "last_scan"), "last_success": get(c, "last_success"), "last_mark": get(c, "last_mark"), "last_error": get(c, "last_error"), "entries_paused": bool(risk_blocks(c, now)), "pause_reasons": risk_blocks(c, now), "emergency_paused": get(c, "emergency_paused") == "true", "controls_supported": True, "fee_rate": FEE, "slippage_rate": SLIPPAGE, "slippage_model": "COINBASE_BOOK_VWAP", "fee_profile": {"market": "SPOT_PRICE_PROXY", "tier": "Intro", "order_type": "TAKER", "maker_rate": .005, "taker_rate": FEE, "source": FEE_SOURCE, "futures_reference": {"maker_rate": .00095, "taker_rate": .001, "additional_contract_charges": True, "applied": False}}, "journal": {"day": get(c, "day"), **dict(j), "limit": 5, "reserved": len(positions)}, "totals": totals, "strategy_results": strategy_results, "decisions": decisions, "news": {p: news_context(c, p, now) for p in PAIRS}, "settings": {"leverage": LEVERAGE, "max_leverage": 3, "risk_per_trade_pct": RISK * 100, "daily_loss_pct": DAILY_LOSS * 100, "stop_pct": STOP * 100, "target_r": 2, "mark_poll_seconds": MARK_POLL, "holding_cost_per_8h": HOLDING_RATE, "maintenance_margin_rate": MAINTENANCE, "max_positions": 2, "scalp_risk_pct": SCALP_RISK * 100, "scalp_max_hold_seconds": SCALP_MAX_HOLD, "scalp_min_net_rr": 2, "scalp_scan_seconds": 60}, "disclosure": "Synthetic isolated-margin simulation on Coinbase SPOT prices, not a Coinbase derivatives account. Entry/exit fills use size-weighted Coinbase spot book depth and the verified-account taker-fee snapshot. Optional additional stress is separate. Snapshot depth is not a guaranteed future fill; unseen market changes can add slippage. Assumed holding cost on both sides, not actual funding. Stops/targets sampled about every 5s; fast crossings can be missed and outages delay exits. Liquidation is an assumed model, not exchange rules. Sniper is a fixed-rule paper strategy, not a trained predictive model. No historical news backtest or profitability claim."}
 
 
 @app.get("/api/journal")
