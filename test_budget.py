@@ -7,7 +7,7 @@ from test_engine import account, quote
 
 
 def product(now):
-    return {'product_id':'ET-27NOV26-CDE','product_type':'FUTURE','price':'2250','base_min_size':'1','base_increment':'1','future_product_details':{'contract_size':'.1','contract_expiry':e.iso(now+20*86400),'intraday_margin_rate':{'long_margin_rate':'.1','short_margin_rate':'.1'},'overnight_margin_rate':{'long_margin_rate':'.237','short_margin_rate':'.2995'}},'fcm_trading_session_details':{'is_session_open':True}}
+    return {'product_id':'ET-27NOV26-CDE','product_type':'FUTURE','price':'2250','base_min_size':'1','base_increment':'1','price_increment':'.5','future_product_details':{'contract_size':'.1','contract_expiry':e.iso(now+20*86400),'intraday_margin_rate':{'long_margin_rate':'.1','short_margin_rate':'.1'},'overnight_margin_rate':{'long_margin_rate':'.237','short_margin_rate':'.2995'}},'fcm_trading_session_details':{'is_session_open':True}}
 
 
 def test_minimum_contract_fee_and_risk_floor():
@@ -39,7 +39,7 @@ def test_no_proxy_fill_can_be_recorded_as_us_futures(monkeypatch):
     now=int(time.time())
     with e.db() as c:
         error=e.open_position(c,'ETH-USD','LONG',quote(),{'bar':now},now)
-        assert 'no spot-proxy substitute' in error
+        assert 'No spot-proxy substitute' in error or 'specifications unavailable' in error
         assert c.execute('SELECT COUNT(*) FROM trades').fetchone()[0]==0
 
 
@@ -55,5 +55,5 @@ def test_new_small_account_persists_without_reset_on_restart(monkeypatch,tmp_pat
         assert float(e.get(c,'starting_cash'))==80
     monkeypatch.setattr(e,'PRACTICE_VENUE','COINBASE_US_FUTURES')
     d=e.dashboard();assert d['account_profile']['starting_cash']==80
-    assert not d['futures_budget']['execution_ready']
+    assert d['futures_budget']['execution_ready']
     assert set(d['futures_budget']['rows'][0]['comparisons'])=={'80','100','150'}
