@@ -1,4 +1,4 @@
-# Chief Paper Gym v2
+# Chief Paper Gym v2.1 · Sniper Scalp + Breakout
 
 Paper-only BTC / ETH / SOL long/short simulator. It has no exchange credentials,
 private exchange APIs, live mode, transfers, or manual order endpoint.
@@ -10,7 +10,7 @@ private exchange APIs, live mode, transfers, or manual order endpoint.
 - Planned risk per new entry <=0.5% equity including modeled stop, fees, slippage and one day of holding costs. Gaps can exceed planned stop risk.
 - Maximum two positions, gross notional <=2x equity, and five daily entries/completions with reservations for open positions. This is a ceiling, not a target.
 - A 2% daily equity drawdown latches an entry halt until the next UTC day. Pause/resume never bypasses that halt.
-- 3% initial stop, 2R target, trailing stop after a 1R advance. Exits use executable bid/ask snapshots about every 15 seconds, including while strategy/news data refreshes. Brief crossings can be missed; network failures delay exits.
+- 3% initial stop, 2R target, trailing stop after a 1R advance. Exits use executable bid/ask snapshots about every 5 seconds, including while strategy/news data refreshes. Brief crossings can be missed; network failures delay exits.
 - Fees and slippage use existing `PAPER_FEE_RATE` and `PAPER_SLIPPAGE`. Holding cost is an explicit 0.01% assumed cost per 8 hours, prorated on both sides, **not exchange funding**.
 - Modeled maintenance margin is 5% of marked notional. Gap losses are capped at the position's isolated margin plus the entry fee. The liquidation model is illustrative, not exchange-specific.
 
@@ -35,7 +35,7 @@ Existing SQLite data is migrated in place; old long positions stay at 1x and old
 fills remain intact. Each new fill retains the entry evidence and costs. `/api/dashboard`
 returns verified daily/all-record totals, margin, direction, targets/stops, current
 news status, and the latest recorded decision for each market. `/api/journal?before=ID`
-paginates every persisted fill. Repetitive WAIT decisions retain 30 days; equity
+paginates every persisted fill. Repetitive Breakout WAIT decisions retain 30 days; Sniper WAIT decisions retain 7 days; equity
 snapshots retain 90 days. Fills and entry evidence are never automatically pruned.
 
 Dashboard and private APIs require the existing Basic-auth dashboard login.
@@ -48,9 +48,48 @@ Keep the existing mounted volume at `/data`, single replica, `/health` healthche
 and `DB_PATH=/data/chief.sqlite`. Existing `DASHBOARD_USER`, `DASHBOARD_PASSWORD`,
 `PAPER_STARTING_CASH`, `PAPER_FEE_RATE`, `PAPER_SLIPPAGE`, `PAPER_PAUSED` and
 `POLL_SECONDS` remain supported. `POLL_SECONDS` defaults to 300 for strategy scans;
-protective quote polling remains separate at 15 seconds.
+protective quote polling remains separate at 5 seconds.
 
 Tests: `pip install -r requirements.txt pytest && python -m pytest -q`.
 Fixtures test accounting, both directions, stops, targets, liquidation gaps, migration,
 restart idempotence, risk limits, RSS freshness/corroboration, and API isolation.
 Test fills use a temporary database and are never published to the live paper journal.
+
+
+## Sniper Scalp
+
+The `SNIPER_SCALP` strategy is enabled alongside `BREAKOUT`, with separate decisions,
+strategy-tagged fills and verified all-record performance statistics. Both share one
+position per pair, two open positions, cash, gross exposure, a 2% daily drawdown halt,
+existing simulated leverage, and the same combined five-trade daily ceiling.
+
+- 1H EMA20/EMA50 trend and EMA20 slope must agree.
+- Completed 5M trend and rolling 15-minute momentum must agree.
+- A 1M candle sweeps and reclaims the prior 12-bar 5M range extreme. Its reference
+  range must have closed before the sweep. This is price action, not order-book data.
+- A later completed 1M candle breaks the sweep candle's structure; the newest
+  completed 1M candle must retest and reject that level in the trend direction.
+- Entry volume >=1.2x preceding 20-bar 1M average. Quote age <=10s; no chasing
+  beyond 0.15% of confirmation price. Existing news gates apply unchanged.
+- Stop beyond the sweep, 0.1%-0.8% from executable entry. Target before the opposite
+  observed range, capped at 2x 5M ATR; target distance is never inflated to force 2R.
+- Require >=2R NET reward/risk after configured fees, bid/ask, slippage and a full
+  15 minutes of assumed holding cost. Planned risk <=0.25% equity. Leverage stays
+  the existing configured paper value. High-cost small targets correctly mean WAIT.
+- A cost-adjusted breakeven stop activates at +1R net. Maximum holding time is
+  15 minutes, exited at the next valid sampled quote. Ten-minute cooldown follows
+  a sniper exit; a preceding breakout exit retains its 30-minute cooldown.
+
+One-minute bars are read once per completed minute; slower structure/news history
+refreshes every five minutes. Protection is a separate loop at about five seconds;
+network latency/outages and unobserved intra-sample crossings still apply.
+
+Chief's chat playbook explains these rules. Relevant chat requests receive bounded,
+authenticated paper evidence through the existing owner-bound encrypted session;
+no engine login or cookie is passed to the model. If unauthenticated, Chief explains
+that private records are unavailable instead of inventing activity.
+
+This configures a fixed-rule forward-test strategy; it does not train a predictive
+model, establish a profitable edge, or complete historical news-aware backtesting.
+Offline tests include a deliberately lower-fee fixture to exercise successful scalp
+accounting. Those fixture fees and trades NEVER replace production settings/history.
