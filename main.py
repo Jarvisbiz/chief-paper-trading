@@ -27,7 +27,7 @@ import futures_runtime as futures
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chief")
-VERSION = "2.6.0-paper"
+VERSION = "2.6.1-paper"
 PAIRS = tuple(practice.ROOTS)
 DB_PATH = os.getenv("DB_PATH", "/data/chief.sqlite")
 START_CASH = float(os.getenv("PAPER_STARTING_CASH", "250"))
@@ -891,6 +891,7 @@ async def scan_once(client,slow_due=True):
                     map_signal_evidence(pair,quote,{},int(time.time()))
                 else:quote=await fetch_quote(client,pair)
                 mark_positions({pair:quote},int(time.time()))
+                status["reference_quote"]={k:quote.get("signal_quote",{}).get(k) for k in ("product_id","price","bid","ask","ts")}
                 status.update(product_id=quote.get("product_id",pair),bid=quote["bid"],ask=quote["ask"],mid=quote["price"],book_at=quote["ts"],book_age_seconds=round(time.time()-quote["ts"],2))
             except (ValueError,httpx.HTTPError) as exc:
                 code=getattr(exc,"code","QUOTE_UNAVAILABLE")
@@ -975,7 +976,7 @@ app = FastAPI(title="Chief | Long/Short PAPER Only", lifespan=lifespan)
 
 @app.middleware("http")
 async def auth(req: Request, call_next):
-    if req.url.path == "/health": return await call_next(req)
+    if req.url.path in ("/health","/market/candles","/market/quotes"): return await call_next(req)
     user, password = os.getenv("DASHBOARD_USER", ""), os.getenv("DASHBOARD_PASSWORD", "")
     if not user or not password: return Response("Dashboard credentials must be set", status_code=503)
     valid = False
@@ -988,6 +989,35 @@ async def auth(req: Request, call_next):
     response = await call_next(req)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/market/candles")
+def public_reference_candles(pair: str = "BTC-USD", interval: int = 300, start: int = 0, end: int = 0):
+    """Only previously collected public spot bars; no account or strategy fields."""
+    if pair not in PAIRS or interval not in (60,300,900,3600,86400):
+        return JSONResponse({"error":"Unsupported public market or interval"},status_code=400)
+    now=int(time.time());end=end or now//interval*interval;start=start or end-350*interval
+    if start<0 or end>now+interval or end<=start or end-start>350*interval:
+        return JSONResponse({"error":"Invalid bounded candle window"},status_code=400)
+    base=300 if interval==900 else interval
+    with db() as c:
+        rows=[dict(r) for r in c.execute("SELECT ts,low,high,open,close,volume FROM signal_bars WHERE pair=? AND interval=? AND ts>=? AND ts+?<=? ORDER BY ts DESC LIMIT 1050",(pair,base,start,base,end))][::-1]
+    if interval==900:
+        groups={}
+        for b in rows:groups.setdefault(b['ts']//900*900,[]).append(b)
+        rows=[{'ts':ts,'low':min(b['low'] for b in group),'high':max(b['high'] for b in group),'open':group[0]['open'],'close':group[-1]['close'],'volume':sum(b['volume'] for b in group)} for ts,group in sorted(groups.items()) if [b['ts'] for b in group]==[ts,ts+300,ts+600] and ts>=start and ts+900<=end]
+    return JSONResponse({'product':pair,'interval':interval,'source':'COINBASE_SPOT_REFERENCE_CANDLES','candles':[[b[k] for k in ('ts','low','high','open','close','volume')] for b in rows[-350:]]},headers={'Cache-Control':'no-store'})
+
+
+@app.get("/market/quotes")
+def public_reference_quotes():
+    with db() as c:states=json.loads(get(c,'market_status') or '{}')
+    quotes=[]
+    for pair in PAIRS:
+        ref=states.get(pair,{}).get('reference_quote',{})
+        if ref.get('product_id')!=pair or not all(isinstance(ref.get(k),(int,float)) and math.isfinite(ref[k]) and ref[k]>0 for k in ('price','bid','ask','ts')):continue
+        quotes.append({'product':pair,'price':ref['price'],'bid':ref['bid'],'ask':ref['ask'],'time':iso(ref['ts']),'quote_type':'SPOT_BOOK_MID'})
+    return JSONResponse({'source':'COINBASE_SPOT_REFERENCE_BOOKS','quotes':quotes},headers={'Cache-Control':'no-store'})
 
 
 @app.get("/health")

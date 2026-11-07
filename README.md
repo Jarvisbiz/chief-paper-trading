@@ -164,3 +164,7 @@ Scans run server-side, three markets at a time. Data outages block the affected 
 ORB is an explicitly labeled default variant, not recalled private historical rules: weekdays New York 09:30–09:45 opening range; entries 09:45–11:30; complete range, completed break then retest, 1H/5M trend alignment and 1.2x entry volume. Structural stop 0.1–0.8%, range/volatility bounded target, 2R net minimum, +1R cost-adjusted breakeven, 30-minute deadline. It shares news, actual futures book execution, fee reserves and daily halt. Sniper retains its 15-minute deadline. Local fixture round trips test both directions without inserting test fills into production.
 
 Dashboard exposes side-specific leverage, one-contract margin/fee floors, $250/$280 whole-lot comparisons and current-equity capacity. Affordability is never a signal or evidence of small loss. Quick profits are not promised. All exchange requests remain public GET reads; this release has no real-order path.
+
+### v2.6.1 — collected public market feed
+
+Two read-only public GET routes expose only collected Coinbase spot bars and spot book mid quotes: `/market/candles` and `/market/quotes`. Product/interval/window bounds are fixed, 15M aggregation requires all three actual 5M buckets, and original market timestamps remain intact. No account balances, positions, fills, strategy evidence or credentials are public. Other routes retain Basic authentication. This lets the private Site recover when both Coinbase endpoints rate-limit the website host. The current $250 SQLite run is retained during this update.

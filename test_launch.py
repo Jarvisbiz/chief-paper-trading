@@ -135,3 +135,37 @@ def test_contract_underlying_units_must_match_reference():
     with pytest.raises(ValueError,match='underlying unit'):b.contract_snapshot(raw,now)
     raw['future_product_details'].update(contract_root_unit='ETH',non_crypto=True)
     with pytest.raises(ValueError,match='underlying unit'):b.contract_snapshot(raw,now)
+
+
+def test_public_collector_returns_real_buckets_and_strict_15m_aggregation():
+    now=1794050100;now=now//900*900
+    rows=[{'ts':now-900+i*300,'low':99,'high':102,'open':100,'close':101,'volume':i+1} for i in range(3)]
+    with e.db() as c:e.store_signal_bars(c,'ETH-USD',300,rows)
+    d=json.loads(e.public_reference_candles('ETH-USD',900,now-900,now).body)
+    assert d['candles']==[[now-900,99,102,100,101,6]]
+    assert set(d)=={'source','product','interval','candles'}
+    with e.db() as c:c.execute('DELETE FROM signal_bars WHERE ts=?',(now-600,))
+    assert json.loads(e.public_reference_candles('ETH-USD',900,now-900,now).body)['candles']==[]
+    assert e.public_reference_candles('http://evil',300).status_code==400
+    assert e.public_reference_candles('ETH-USD',15).status_code==400
+    assert e.public_reference_candles('ETH-USD',300,now-400*300,now).status_code==400
+
+
+def test_public_quotes_whitelist_only_public_book_fields():
+    with e.db() as c:
+        e.put(c,'market_status',json.dumps({'ETH-USD':{'reference_quote':{'product_id':'ETH-USD','price':2000,'bid':1999,'ask':2001,'ts':1794050000,'cash':250},'decisions':[{'private':'hidden'}]}}))
+    d=json.loads(e.public_reference_quotes().body)
+    assert len(d['quotes'])==1 and set(d['quotes'][0])=={'product','price','bid','ask','time','quote_type'}
+    assert 'cash' not in json.dumps(d) and 'hidden' not in json.dumps(d)
+
+
+def test_public_feed_is_read_only_and_private_ledger_stays_authenticated(monkeypatch):
+    monkeypatch.setenv('DASHBOARD_USER','test');monkeypatch.setenv('DASHBOARD_PASSWORD','test-password')
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=e.app),base_url='http://test') as c:
+            assert (await c.get('/market/quotes')).status_code==200
+            assert (await c.get('/market/candles')).status_code==200
+            assert (await c.post('/market/candles')).status_code==405
+            assert (await c.get('/api/dashboard')).status_code==401
+            assert (await c.get('/api/journal')).status_code==401
+    asyncio.run(run())
